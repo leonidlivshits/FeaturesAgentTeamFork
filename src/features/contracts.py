@@ -16,16 +16,25 @@ class FeatureSet:
     description: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def validate(self) -> None:
+    def validate(
+        self,
+        expected_train_rows: int | None = None,
+        expected_test_rows: int | None = None,
+    ) -> None:
         if list(self.train_features.columns) != list(self.test_features.columns):
             raise ValueError(
                 f"Feature columns mismatch for set '{self.name}'. "
                 f"train: {list(self.train_features.columns)}, test: {list(self.test_features.columns)}"
             )
-        if len(self.train_features) != len(self.test_features):
+        if expected_train_rows is not None and len(self.train_features) != expected_train_rows:
             raise ValueError(
                 f"Feature row count mismatch for set '{self.name}'. "
-                f"train rows: {len(self.train_features)}, test rows: {len(self.test_features)}"
+                f"train rows: {len(self.train_features)}, expected: {expected_train_rows}"
+            )
+        if expected_test_rows is not None and len(self.test_features) != expected_test_rows:
+            raise ValueError(
+                f"Feature row count mismatch for set '{self.name}'. "
+                f"test rows: {len(self.test_features)}, expected: {expected_test_rows}"
             )
 
 

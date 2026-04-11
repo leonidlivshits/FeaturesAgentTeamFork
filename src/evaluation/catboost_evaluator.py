@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import time
 
 import numpy as np
 import pandas as pd
@@ -8,7 +10,10 @@ from catboost import CatBoostClassifier
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
+from src.core.runtime import RuntimeBudget
 from src.features.contracts import FeatureSet
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -16,6 +21,7 @@ class FeatureSetScore:
     feature_set_name: str
     score: float
     n_features: int
+    elapsed_sec: float
 
 
 class CatBoostFeatureEvaluator:
@@ -24,21 +30,50 @@ class CatBoostFeatureEvaluator:
         self.random_seed = random_seed
 
     def select_best(
-        self, feature_sets: list[FeatureSet], target: pd.Series
+        self,
+        feature_sets: list[FeatureSet],
+        target: pd.Series,
+        runtime_budget: RuntimeBudget | None = None,
+        min_seconds_per_candidate_eval: float = 0.0,
     ) -> tuple[FeatureSet, list[FeatureSetScore]]:
         if not feature_sets:
             raise ValueError("No feature sets to evaluate.")
 
         scores: list[FeatureSetScore] = []
-        for feature_set in feature_sets:
+        total_candidates = len(feature_sets)
+        for index, feature_set in enumerate(feature_sets, start=1):
+            if runtime_budget is not None and scores and not runtime_budget.has_time(min_seconds_per_candidate_eval):
+                logger.warning(
+                    "Stopping candidate evaluation due runtime budget: evaluated=%s/%s, remaining=%.2fs",
+                    len(scores),
+                    total_candidates,
+                    runtime_budget.remaining(),
+                )
+                break
+
+            started_at = time.perf_counter()
             auc = self._cross_validated_auc(feature_set.train_features, target)
+            elapsed_sec = time.perf_counter() - started_at
             scores.append(
                 FeatureSetScore(
                     feature_set_name=feature_set.name,
                     score=auc,
                     n_features=feature_set.train_features.shape[1],
+                    elapsed_sec=elapsed_sec,
                 )
             )
+            logger.info(
+                "Candidate evaluated %s/%s: name=%s auc=%.6f features=%s elapsed=%.2fs",
+                index,
+                total_candidates,
+                feature_set.name,
+                auc,
+                feature_set.train_features.shape[1],
+                elapsed_sec,
+            )
+
+        if not scores:
+            raise ValueError("No feature sets were evaluated within runtime budget.")
 
         best_score = max(scores, key=lambda score: (score.score, -score.n_features))
         best_feature_set = next(
@@ -104,4 +139,3 @@ class CatBoostFeatureEvaluator:
                 prepared[column] = pd.to_numeric(prepared[column], errors="coerce").fillna(-999.0)
 
         return prepared, cat_feature_indices
-
