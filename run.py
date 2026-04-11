@@ -23,6 +23,7 @@ def main() -> None:
     print("Target column:", result.target_column)
     print("Generator mode:", result.decision_trace.get("effective_mode", "n/a"))
     print("Plan source:", result.decision_trace.get("plan_source", "n/a"))
+    print("LLM provider:", result.decision_trace.get("llm_provider", "n/a"))
 
 
 if __name__ == "__main__":

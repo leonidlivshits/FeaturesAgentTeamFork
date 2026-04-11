@@ -12,7 +12,7 @@ from sklearn.metrics import roc_auc_score
 
 from src.core.config import DEFAULT_CONFIG
 from src.core.json_utils import safe_json_load
-from src.core.llm import get_gigachat_client
+from src.core.llm import get_effective_llm_provider, get_llm_client
 from src.data.loaders import DataBundle
 from src.features.contracts import FeatureSet
 
@@ -64,13 +64,14 @@ class LlmGuidedGenerator:
 
     def __init__(self) -> None:
         self.disable_llm = os.getenv("FEATURES_AGENT_DISABLE_LLM", "0").strip() in {"1", "true", "yes"}
-        self.client = None if self.disable_llm else get_gigachat_client()
+        self.llm_provider = "none" if self.disable_llm else get_effective_llm_provider()
+        self.client = None if self.disable_llm else get_llm_client()
 
     def generate(self, bundle: DataBundle, max_features: int) -> list[FeatureSet]:
         common_columns = [
             column
             for column in bundle.train.columns
-            if column in bundle.test.columns and column != bundle.id_column
+            if column in bundle.test.columns and column not in {bundle.id_column, bundle.target_column}
         ]
         if not common_columns:
             return []
@@ -119,6 +120,7 @@ class LlmGuidedGenerator:
                 description="Feature set proposed by LLM and computed by safe local operators.",
                 metadata={
                     "plan_source": plan_source,
+                    "llm_provider": self.llm_provider,
                     "selected_operations": selected_operations,
                     "selected_feature_scores": {column: selection_scores.get(column, 0.0) for column in selected_columns},
                     "candidate_plan_size": len(plan),
@@ -159,7 +161,7 @@ class LlmGuidedGenerator:
             logger.info("LLM usage disabled by FEATURES_AGENT_DISABLE_LLM, using fallback plan.")
             return []
         if self.client is None:
-            logger.info("LLM client is unavailable, using fallback plan.")
+            logger.info("LLM client is unavailable for provider '%s', using fallback plan.", self.llm_provider)
             return []
 
         prompt = self._build_prompt(

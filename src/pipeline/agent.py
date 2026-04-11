@@ -79,6 +79,7 @@ def run_pipeline() -> PipelineResult:
         "selected_cv_auc": round(float(best_score.score), 6),
         "selected_n_features": int(selected_feature_set.train_features.shape[1]),
         "plan_source": selected_metadata.get("plan_source", "n/a"),
+        "llm_provider": selected_metadata.get("llm_provider", "n/a"),
     }
     ranked_scores = sorted(scores, key=lambda score: score.score, reverse=True)
     for rank, score in enumerate(ranked_scores, start=1):

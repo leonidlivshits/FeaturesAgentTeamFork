@@ -62,12 +62,20 @@ def infer_key_columns(train: pd.DataFrame, test: pd.DataFrame) -> tuple[str, str
     if not common_columns:
         raise ValueError("Unable to infer id column: no shared columns between train and test.")
 
+    # Standard case: target exists only in train.
     target_candidates = [column for column in train.columns if column not in test.columns]
-    if not target_candidates:
-        raise ValueError("Unable to infer target column: train and test columns are identical.")
+    if target_candidates:
+        target_column = pick_target_column(target_candidates)
+    else:
+        # Some local debug datasets may include target in test too.
+        # In this case we still infer a target by preferred names / binary heuristic.
+        target_column = pick_target_column_from_shared(train=train, common_columns=common_columns)
 
-    target_column = pick_target_column(target_candidates)
-    id_column = pick_id_column(train=train, test=test, common_columns=common_columns)
+    id_candidates = [column for column in common_columns if column != target_column]
+    if not id_candidates:
+        raise ValueError("Unable to infer id column: no columns left after excluding target.")
+
+    id_column = pick_id_column(train=train, test=test, common_columns=id_candidates)
     return id_column, target_column
 
 
@@ -79,6 +87,28 @@ def pick_target_column(target_candidates: list[str]) -> str:
     if len(target_candidates) == 1:
         return target_candidates[0]
     return target_candidates[0]
+
+
+def pick_target_column_from_shared(train: pd.DataFrame, common_columns: list[str]) -> str:
+    lowered_map = {column.lower(): column for column in common_columns}
+    for preferred in PREFERRED_TARGET_NAMES:
+        if preferred in lowered_map:
+            return lowered_map[preferred]
+
+    # Fallback: choose a low-cardinality binary-like column that is unlikely an id.
+    binary_candidates: list[str] = []
+    for column in common_columns:
+        series = train[column]
+        nunique = series.nunique(dropna=True)
+        if nunique <= 2 and series.dtype != "object":
+            if "id" not in column.lower():
+                binary_candidates.append(column)
+    if binary_candidates:
+        return binary_candidates[0]
+
+    raise ValueError(
+        "Unable to infer target column: train/test columns are identical and no known target field found."
+    )
 
 
 def pick_id_column(train: pd.DataFrame, test: pd.DataFrame, common_columns: list[str]) -> str:
@@ -95,4 +125,3 @@ def pick_id_column(train: pd.DataFrame, test: pd.DataFrame, common_columns: list
         ),
     )
     return ranked[0]
-
