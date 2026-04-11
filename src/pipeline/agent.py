@@ -70,6 +70,18 @@ def run_pipeline() -> PipelineResult:
     score_lookup = {score.feature_set_name: score for score in scores}
     best_score = score_lookup.get(selected_feature_set.name, max(scores, key=lambda score: score.score))
     selected_metadata = selected_feature_set.metadata if isinstance(selected_feature_set.metadata, dict) else {}
+    llm_candidate_sets = [
+        feature_set
+        for feature_set in feature_sets
+        if isinstance(feature_set.metadata, dict) and feature_set.metadata.get("plan_source") == "llm"
+    ]
+    llm_providers_seen = sorted(
+        {
+            str(feature_set.metadata.get("llm_provider"))
+            for feature_set in feature_sets
+            if isinstance(feature_set.metadata, dict) and feature_set.metadata.get("llm_provider")
+        }
+    )
     decision_trace: dict[str, Any] = {
         "requested_mode": get_generator_mode(),
         "effective_mode": get_effective_generator_mode(),
@@ -78,8 +90,11 @@ def run_pipeline() -> PipelineResult:
         "selected_feature_set": selected_feature_set.name,
         "selected_cv_auc": round(float(best_score.score), 6),
         "selected_n_features": int(selected_feature_set.train_features.shape[1]),
-        "plan_source": selected_metadata.get("plan_source", "n/a"),
-        "llm_provider": selected_metadata.get("llm_provider", "n/a"),
+        "selected_plan_source": selected_metadata.get("plan_source", "n/a"),
+        "selected_llm_provider": selected_metadata.get("llm_provider", "n/a"),
+        "llm_candidate_sets": len(llm_candidate_sets),
+        "llm_was_used": bool(llm_candidate_sets),
+        "llm_providers_seen": llm_providers_seen or ["n/a"],
     }
     ranked_scores = sorted(scores, key=lambda score: score.score, reverse=True)
     for rank, score in enumerate(ranked_scores, start=1):

@@ -68,10 +68,11 @@ class LlmGuidedGenerator:
         self.client = None if self.disable_llm else get_llm_client()
 
     def generate(self, bundle: DataBundle, max_features: int) -> list[FeatureSet]:
+        train_context, test_context = self._build_feature_context(bundle)
         common_columns = [
             column
-            for column in bundle.train.columns
-            if column in bundle.test.columns and column not in {bundle.id_column, bundle.target_column}
+            for column in train_context.columns
+            if column in test_context.columns and column not in {bundle.id_column, bundle.target_column}
         ]
         if not common_columns:
             return []
@@ -79,7 +80,7 @@ class LlmGuidedGenerator:
         numeric_columns = [
             column
             for column in common_columns
-            if pd.api.types.is_numeric_dtype(bundle.train[column])
+            if pd.api.types.is_numeric_dtype(train_context[column])
         ]
         categorical_columns = [column for column in common_columns if column not in numeric_columns]
         if not numeric_columns and not categorical_columns:
@@ -94,7 +95,11 @@ class LlmGuidedGenerator:
         if not plan:
             return []
 
-        train_features, test_features, feature_operations = self._apply_plan(bundle=bundle, specs=plan)
+        train_features, test_features, feature_operations = self._apply_plan(
+            train_df=train_context,
+            test_df=test_context,
+            specs=plan,
+        )
         if train_features.empty:
             return []
 
@@ -368,11 +373,12 @@ Output schema:
 
     def _apply_plan(
         self,
-        bundle: DataBundle,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
         specs: list[FeatureSpec],
     ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
-        train_result = pd.DataFrame(index=bundle.train.index)
-        test_result = pd.DataFrame(index=bundle.test.index)
+        train_result = pd.DataFrame(index=train_df.index)
+        test_result = pd.DataFrame(index=test_df.index)
         feature_operations: dict[str, str] = {}
 
         used_names: set[str] = set()
@@ -382,7 +388,11 @@ Output schema:
                 continue
 
             try:
-                train_series, test_series = self._compute_feature(bundle=bundle, spec=spec)
+                train_series, test_series = self._compute_feature(
+                    train_df=train_df,
+                    test_df=test_df,
+                    spec=spec,
+                )
             except Exception as error:
                 logger.debug("Failed to compute feature '%s': %s", feature_name, error)
                 continue
@@ -404,6 +414,57 @@ Output schema:
 
         return train_result, test_result, feature_operations
 
+    def _build_feature_context(self, bundle: DataBundle) -> tuple[pd.DataFrame, pd.DataFrame]:
+        train_context = bundle.train.copy()
+        test_context = bundle.test.copy()
+
+        for table_name, aux_df in bundle.aux_tables.items():
+            if bundle.id_column not in aux_df.columns:
+                continue
+            prepared_aux = self._prepare_aux_table(
+                aux_df=aux_df,
+                id_column=bundle.id_column,
+                table_name=table_name,
+            )
+            if prepared_aux.empty:
+                continue
+
+            train_context = train_context.merge(prepared_aux, on=bundle.id_column, how="left")
+            test_context = test_context.merge(prepared_aux, on=bundle.id_column, how="left")
+
+        return train_context, test_context
+
+    @staticmethod
+    def _prepare_aux_table(aux_df: pd.DataFrame, id_column: str, table_name: str) -> pd.DataFrame:
+        safe_prefix = table_name.replace(" ", "_").lower()
+        working = aux_df.copy()
+
+        renamed: dict[str, str] = {}
+        for column in working.columns:
+            if column == id_column:
+                continue
+            renamed[column] = f"{safe_prefix}__{column}"
+        working = working.rename(columns=renamed)
+
+        numeric_cols = [column for column in working.columns if column != id_column and pd.api.types.is_numeric_dtype(working[column])]
+        categorical_cols = [column for column in working.columns if column != id_column and column not in numeric_cols]
+
+        if not numeric_cols and not categorical_cols:
+            return pd.DataFrame()
+
+        agg_spec: dict[str, str] = {}
+        for column in numeric_cols:
+            agg_spec[column] = "mean"
+        for column in categorical_cols:
+            agg_spec[column] = "first"
+
+        grouped = working.groupby(id_column, dropna=False).agg(agg_spec).reset_index()
+        row_count = (
+            working.groupby(id_column, dropna=False).size().rename(f"{safe_prefix}__row_count").reset_index()
+        )
+        grouped = grouped.merge(row_count, on=id_column, how="left")
+        return grouped
+
     @staticmethod
     def _safe_feature_name(name: str, used_names: set[str]) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9_]+", "_", name.strip().lower()).strip("_")
@@ -420,9 +481,12 @@ Output schema:
         used_names.add(final_name)
         return final_name
 
-    def _compute_feature(self, bundle: DataBundle, spec: FeatureSpec) -> tuple[pd.Series | None, pd.Series | None]:
-        train_df = bundle.train
-        test_df = bundle.test
+    def _compute_feature(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        spec: FeatureSpec,
+    ) -> tuple[pd.Series | None, pd.Series | None]:
         operation = spec.operation
         columns = spec.columns
 

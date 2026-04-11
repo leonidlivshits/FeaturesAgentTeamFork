@@ -22,8 +22,11 @@ def main() -> None:
     print("ID column:", result.id_column)
     print("Target column:", result.target_column)
     print("Generator mode:", result.decision_trace.get("effective_mode", "n/a"))
-    print("Plan source:", result.decision_trace.get("plan_source", "n/a"))
-    print("LLM provider:", result.decision_trace.get("llm_provider", "n/a"))
+    print("Selected plan source:", result.decision_trace.get("selected_plan_source", "n/a"))
+    print("Selected LLM provider:", result.decision_trace.get("selected_llm_provider", "n/a"))
+    print("LLM was used:", result.decision_trace.get("llm_was_used", False))
+    print("LLM candidate sets:", result.decision_trace.get("llm_candidate_sets", 0))
+    print("LLM providers seen:", ", ".join(result.decision_trace.get("llm_providers_seen", ["n/a"])))
 
 
 if __name__ == "__main__":

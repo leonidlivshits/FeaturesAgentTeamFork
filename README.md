@@ -143,6 +143,11 @@
 uv venv
 uv sync
 ```
+- Запуск из окружения `uv` (рекомендуется, чтобы не ловить `ModuleNotFoundError`):
+```bash
+uv run python run.py
+uv run python src/utils/check_submission.py
+```
 - Все зависимости должны быть из `pyproject.toml`;
 - Все входные данные читаются **только** из папки `data/`;
 - Все выходные артефакты сохраняются **только** в папку `output/`;
@@ -156,6 +161,18 @@ python run.py
   GIGACHAT_SCOPE='GIGACHAT_API_CORP'
   ```
   `.env` в обязательном порядке должен быть в передаваемом zip-архиве;
+- Для тестов можно использовать OpenRouter вместо GigaChat:
+  ```bash
+  OPENROUTER_API_KEY='sk-or-v1-...'
+  OPENROUTER_MODEL='qwen/qwen-2.5-72b-instruct'
+  OPENROUTER_BASE_URL='https://openrouter.ai/api/v1'
+  LLM_PROVIDER='openrouter'   # auto | gigachat | openrouter
+  ```
+- Опционально можно управлять режимом генерации признаков:
+  ```bash
+  FEATURES_AGENT_MODE='auto'        # auto | hybrid | heuristic | llm
+  FEATURES_AGENT_DISABLE_LLM='0'    # 1 чтобы принудительно выключить LLM
+  ```
 - Решение не должно требовать ручного редактирования кода перед запуском;
 - Решение не должно зависеть от локальных путей, настроек IDE или ручной подготовки окружения;
 - Максимальное время работы агента **600 секунд**.
@@ -167,3 +184,12 @@ python src/utils/check_submission.py
 ```
 Перед запуском убедитесь, что в папке `data` размещены входные данные для задачи.
 Делать сабмит на платформу имеет смысл лишь после прохождения всех проверок в данном файле.
+
+Для удобной финальной упаковки сабмита одной командой:
+```bash
+python src/utils/presubmit.py
+```
+Скрипт:
+- проверяет `.env`;
+- запускает `check_submission.py`;
+- создает zip-архив в папке `dist/`.
