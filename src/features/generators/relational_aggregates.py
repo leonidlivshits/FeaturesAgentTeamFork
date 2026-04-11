@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,9 @@ from src.features.contracts import FeatureSet
 class JoinPlan:
     table_name: str
     key_column: str
+    coverage_score: float
+    hint_score: float
+    total_score: float
 
 
 class RelationalAggregatesGenerator:
@@ -64,6 +68,14 @@ class RelationalAggregatesGenerator:
                 metadata={
                     "tables_used": [plan.table_name for plan in join_plans],
                     "join_keys": {plan.table_name: plan.key_column for plan in join_plans},
+                    "join_scores": {
+                        plan.table_name: {
+                            "coverage": round(plan.coverage_score, 6),
+                            "hint": round(plan.hint_score, 6),
+                            "total": round(plan.total_score, 6),
+                        }
+                        for plan in join_plans
+                    },
                 },
             )
         ]
@@ -71,24 +83,57 @@ class RelationalAggregatesGenerator:
     def _build_join_plans(self, bundle: DataBundle) -> list[JoinPlan]:
         base_columns = set(bundle.train.columns) & set(bundle.test.columns)
         plans: list[JoinPlan] = []
+        readme_text = (bundle.data_readme or "").lower()
 
         for table_name, aux_df in bundle.aux_tables.items():
             common_cols = [column for column in aux_df.columns if column in base_columns]
             if not common_cols:
                 continue
 
-            best_key = max(
-                common_cols,
-                key=lambda column: self._join_coverage_score(
+            scored_candidates: list[tuple[str, float, float, float]] = []
+            for column in common_cols:
+                coverage_train = self._join_coverage_score(
                     base_values=bundle.train[column],
                     aux_values=aux_df[column],
-                ),
-            )
+                )
+                coverage_test = self._join_coverage_score(
+                    base_values=bundle.test[column],
+                    aux_values=aux_df[column],
+                )
+                coverage = min(coverage_train, coverage_test)
+                hint = self._readme_hint_score(
+                    readme_text=readme_text,
+                    table_name=table_name,
+                    key_column=column,
+                    id_column=bundle.id_column,
+                )
+                prior = self._column_name_prior(column=column, id_column=bundle.id_column)
+                total = 0.72 * coverage + 0.20 * hint + 0.08 * prior
+                scored_candidates.append((column, coverage, hint, total))
 
-            if self._join_coverage_score(bundle.train[best_key], aux_df[best_key]) <= 0.05:
+            if not scored_candidates:
                 continue
 
-            plans.append(JoinPlan(table_name=table_name, key_column=best_key))
+            best_key, coverage_score, hint_score, total_score = max(
+                scored_candidates,
+                key=lambda item: item[3],
+            )
+
+            # Conservative gate: keep only meaningful join plans.
+            if coverage_score <= 0.03 and hint_score < 0.6:
+                continue
+            if total_score < 0.08:
+                continue
+
+            plans.append(
+                JoinPlan(
+                    table_name=table_name,
+                    key_column=best_key,
+                    coverage_score=coverage_score,
+                    hint_score=hint_score,
+                    total_score=total_score,
+                )
+            )
 
         return plans
 
@@ -99,6 +144,88 @@ class RelationalAggregatesGenerator:
             return 0.0
         aux_unique = set(aux_values.dropna().astype(str).unique())
         return len(base_unique & aux_unique) / len(base_unique)
+
+    def _readme_hint_score(
+        self,
+        *,
+        readme_text: str,
+        table_name: str,
+        key_column: str,
+        id_column: str,
+    ) -> float:
+        if not readme_text:
+            return 0.0
+
+        table_variants = self._text_variants(table_name)
+        key_variants = self._text_variants(key_column)
+        if not table_variants or not key_variants:
+            return 0.0
+
+        score = 0.0
+        keywords = (
+            "join",
+            "key",
+            "foreign key",
+            "связ",
+            "ключ",
+            "внешн",
+            "идентифик",
+            "id",
+        )
+
+        if any(variant in readme_text for variant in table_variants) and any(
+            variant in readme_text for variant in key_variants
+        ):
+            score += 0.25
+
+        table_pattern = "|".join(re.escape(variant) for variant in table_variants if variant)
+        key_pattern = "|".join(re.escape(variant) for variant in key_variants if variant)
+        if table_pattern and key_pattern:
+            proximity_patterns = [
+                rf"(?:{table_pattern}).{{0,140}}(?:{key_pattern})",
+                rf"(?:{key_pattern}).{{0,140}}(?:{table_pattern})",
+            ]
+            for pattern in proximity_patterns:
+                if re.search(pattern, readme_text, flags=re.IGNORECASE | re.DOTALL):
+                    score += 0.25
+                    break
+
+        for keyword in keywords:
+            if keyword in readme_text and any(variant in readme_text for variant in key_variants):
+                score += 0.05
+                break
+
+        if key_column.lower() == id_column.lower():
+            score += 0.1
+
+        return float(min(1.0, score))
+
+    @staticmethod
+    def _column_name_prior(column: str, id_column: str) -> float:
+        name = column.lower()
+        prior = 0.0
+        if name == id_column.lower():
+            prior += 1.0
+        if name.endswith("_id"):
+            prior += 0.8
+        if "id" in name:
+            prior += 0.4
+        if "key" in name:
+            prior += 0.3
+        return float(min(1.0, prior))
+
+    @staticmethod
+    def _text_variants(value: str) -> list[str]:
+        raw = value.strip().lower()
+        if not raw:
+            return []
+        variants = {
+            raw,
+            raw.replace("_", " "),
+            re.sub(r"[^a-zа-я0-9_ ]+", " ", raw).strip(),
+            re.sub(r"[^a-zа-я0-9]+", "", raw),
+        }
+        return [variant for variant in variants if variant]
 
     def _aggregate_aux_table(self, aux_df: pd.DataFrame, key_column: str, table_prefix: str) -> pd.DataFrame:
         if key_column not in aux_df.columns:
@@ -169,4 +296,3 @@ class RelationalAggregatesGenerator:
         except Exception:
             return 0.0
         return abs(float(auc) - 0.5)
-

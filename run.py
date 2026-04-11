@@ -21,6 +21,8 @@ def main() -> None:
     print("Generated features:", result.generated_feature_count)
     print("ID column:", result.id_column)
     print("Target column:", result.target_column)
+    print("Generator mode:", result.decision_trace.get("effective_mode", "n/a"))
+    print("Plan source:", result.decision_trace.get("plan_source", "n/a"))
 
 
 if __name__ == "__main__":

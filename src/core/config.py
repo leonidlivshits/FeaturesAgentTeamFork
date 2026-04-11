@@ -21,6 +21,8 @@ class RuntimeConfig:
     min_seconds_per_generator: int = 8
     min_seconds_per_candidate_eval: int = 12
     max_candidate_feature_sets: int = 10
+    llm_plan_max_attempts: int = 3
+    default_generator_mode: str = "auto"
 
 
 DEFAULT_CONFIG = RuntimeConfig()

@@ -52,7 +52,15 @@ class CatBoostFeatureEvaluator:
                 break
 
             started_at = time.perf_counter()
-            auc = self._cross_validated_auc(feature_set.train_features, target)
+            try:
+                auc = self._cross_validated_auc(feature_set.train_features, target)
+            except Exception as error:
+                logger.warning(
+                    "Candidate evaluation failed, fallback score will be used: name=%s error=%s",
+                    feature_set.name,
+                    error,
+                )
+                auc = 0.5
             elapsed_sec = time.perf_counter() - started_at
             scores.append(
                 FeatureSetScore(
@@ -73,7 +81,18 @@ class CatBoostFeatureEvaluator:
             )
 
         if not scores:
-            raise ValueError("No feature sets were evaluated within runtime budget.")
+            fallback_set = feature_sets[0]
+            fallback_score = FeatureSetScore(
+                feature_set_name=fallback_set.name,
+                score=0.5,
+                n_features=fallback_set.train_features.shape[1],
+                elapsed_sec=0.0,
+            )
+            logger.warning(
+                "No feature sets were evaluated within runtime budget, selecting first candidate as fallback: %s",
+                fallback_set.name,
+            )
+            return fallback_set, [fallback_score]
 
         best_score = max(scores, key=lambda score: (score.score, -score.n_features))
         best_feature_set = next(

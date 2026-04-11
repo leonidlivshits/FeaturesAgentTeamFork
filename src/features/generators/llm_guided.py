@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-import json
 import logging
+import os
 import re
+import time
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
+from src.core.config import DEFAULT_CONFIG
+from src.core.json_utils import safe_json_load
 from src.core.llm import get_gigachat_client
 from src.data.loaders import DataBundle
 from src.features.contracts import FeatureSet
@@ -60,7 +63,8 @@ class LlmGuidedGenerator:
     name = "llm_guided"
 
     def __init__(self) -> None:
-        self.client = get_gigachat_client()
+        self.disable_llm = os.getenv("FEATURES_AGENT_DISABLE_LLM", "0").strip() in {"1", "true", "yes"}
+        self.client = None if self.disable_llm else get_gigachat_client()
 
     def generate(self, bundle: DataBundle, max_features: int) -> list[FeatureSet]:
         common_columns = [
@@ -80,7 +84,7 @@ class LlmGuidedGenerator:
         if not numeric_columns and not categorical_columns:
             return []
 
-        plan = self._build_plan(
+        plan, plan_source = self._build_plan(
             bundle=bundle,
             numeric_columns=numeric_columns,
             categorical_columns=categorical_columns,
@@ -114,6 +118,7 @@ class LlmGuidedGenerator:
                 test_features=test_features[selected_columns].copy(),
                 description="Feature set proposed by LLM and computed by safe local operators.",
                 metadata={
+                    "plan_source": plan_source,
                     "selected_operations": selected_operations,
                     "selected_feature_scores": {column: selection_scores.get(column, 0.0) for column in selected_columns},
                     "candidate_plan_size": len(plan),
@@ -127,7 +132,7 @@ class LlmGuidedGenerator:
         numeric_columns: list[str],
         categorical_columns: list[str],
         max_features: int,
-    ) -> list[FeatureSpec]:
+    ) -> tuple[list[FeatureSpec], str]:
         llm_plan = self._request_llm_plan(
             bundle=bundle,
             numeric_columns=numeric_columns,
@@ -135,13 +140,13 @@ class LlmGuidedGenerator:
             max_features=max_features,
         )
         if llm_plan:
-            return self._normalize_plan(llm_plan, max_features=max_features)
+            return self._normalize_plan(llm_plan, max_features=max_features), "llm"
         fallback = self._fallback_plan(
             numeric_columns=numeric_columns,
             categorical_columns=categorical_columns,
             max_features=max_features,
         )
-        return self._normalize_plan(fallback, max_features=max_features)
+        return self._normalize_plan(fallback, max_features=max_features), "fallback"
 
     def _request_llm_plan(
         self,
@@ -150,7 +155,11 @@ class LlmGuidedGenerator:
         categorical_columns: list[str],
         max_features: int,
     ) -> list[FeatureSpec]:
+        if self.disable_llm:
+            logger.info("LLM usage disabled by FEATURES_AGENT_DISABLE_LLM, using fallback plan.")
+            return []
         if self.client is None:
+            logger.info("LLM client is unavailable, using fallback plan.")
             return []
 
         prompt = self._build_prompt(
@@ -160,18 +169,29 @@ class LlmGuidedGenerator:
             max_features=max_features,
         )
 
-        try:
-            response = self.client.invoke(prompt)
-            response_text = self._response_to_text(response)
-            return self._parse_plan(
-                response_text=response_text,
-                known_columns=set(numeric_columns + categorical_columns),
-                numeric_columns=set(numeric_columns),
-                categorical_columns=set(categorical_columns),
-            )
-        except Exception as error:
-            logger.warning("LLM plan generation failed, fallback will be used: %s", error)
-            return []
+        attempts = max(1, DEFAULT_CONFIG.llm_plan_max_attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.client.invoke(prompt)
+                response_text = self._response_to_text(response)
+                parsed = self._parse_plan(
+                    response_text=response_text,
+                    known_columns=set(numeric_columns + categorical_columns),
+                    numeric_columns=set(numeric_columns),
+                    categorical_columns=set(categorical_columns),
+                )
+                if parsed:
+                    logger.info("LLM plan received: attempt=%s specs=%s", attempt, len(parsed))
+                    return parsed
+                logger.warning("LLM returned empty/invalid plan on attempt %s/%s", attempt, attempts)
+            except Exception as error:
+                logger.warning("LLM plan generation attempt %s/%s failed: %s", attempt, attempts, error)
+
+            if attempt < attempts:
+                time.sleep(min(0.25 * attempt, 0.8))
+
+        logger.warning("LLM plan generation failed after %s attempts, fallback will be used.", attempts)
+        return []
 
     @staticmethod
     def _build_prompt(
@@ -239,7 +259,7 @@ Output schema:
         numeric_columns: set[str],
         categorical_columns: set[str],
     ) -> list[FeatureSpec]:
-        parsed = self._safe_json_load(response_text)
+        parsed = safe_json_load(response_text)
         if not isinstance(parsed, dict):
             return []
         items = parsed.get("features", [])
@@ -267,21 +287,6 @@ Output schema:
             if spec is not None:
                 result.append(spec)
         return result
-
-    @staticmethod
-    def _safe_json_load(text: str) -> object:
-        payload = text.strip()
-        payload = payload.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        try:
-            return json.loads(payload)
-        except Exception:
-            match = re.search(r"\{[\s\S]*\}", payload)
-            if not match:
-                return {}
-            try:
-                return json.loads(match.group(0))
-            except Exception:
-                return {}
 
     def _validate_spec(
         self,

@@ -3,15 +3,18 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
+import numpy as np
 import pandas as pd
+from sklearn.metrics import roc_auc_score
 
 from src.core.config import DATA_DIR, DEFAULT_CONFIG, OUTPUT_DIR
 from src.core.runtime import RuntimeBudget, ensure_input_contract, ensure_output_contract, prepare_output_dir
 from src.data.loaders import DataBundle, load_data_bundle
 from src.evaluation.catboost_evaluator import CatBoostFeatureEvaluator, FeatureSetScore
 from src.features.contracts import FeatureSet
-from src.features.registry import build_generators
+from src.features.registry import build_generators, get_effective_generator_mode, get_generator_mode
 from src.io.contracts import validate_output_contract
 from src.io.writer import write_submission
 
@@ -26,6 +29,7 @@ class PipelineResult:
     id_column: str
     target_column: str
     all_scores: list[FeatureSetScore]
+    decision_trace: dict[str, Any]
 
 
 def run_pipeline() -> PipelineResult:
@@ -64,7 +68,18 @@ def run_pipeline() -> PipelineResult:
     ensure_output_contract(OUTPUT_DIR)
 
     score_lookup = {score.feature_set_name: score for score in scores}
-    best_score = score_lookup[selected_feature_set.name]
+    best_score = score_lookup.get(selected_feature_set.name, max(scores, key=lambda score: score.score))
+    selected_metadata = selected_feature_set.metadata if isinstance(selected_feature_set.metadata, dict) else {}
+    decision_trace: dict[str, Any] = {
+        "requested_mode": get_generator_mode(),
+        "effective_mode": get_effective_generator_mode(),
+        "candidate_sets_generated": len(feature_sets),
+        "candidate_sets_evaluated": len(scores),
+        "selected_feature_set": selected_feature_set.name,
+        "selected_cv_auc": round(float(best_score.score), 6),
+        "selected_n_features": int(selected_feature_set.train_features.shape[1]),
+        "plan_source": selected_metadata.get("plan_source", "n/a"),
+    }
     ranked_scores = sorted(scores, key=lambda score: score.score, reverse=True)
     for rank, score in enumerate(ranked_scores, start=1):
         logger.info(
@@ -84,6 +99,7 @@ def run_pipeline() -> PipelineResult:
         runtime_budget.elapsed(),
         runtime_budget.remaining(),
     )
+    logger.info("Decision trace: %s", decision_trace)
 
     return PipelineResult(
         best_feature_set=selected_feature_set.name,
@@ -92,6 +108,7 @@ def run_pipeline() -> PipelineResult:
         id_column=bundle.id_column,
         target_column=bundle.target_column,
         all_scores=scores,
+        decision_trace=decision_trace,
     )
 
 
@@ -126,11 +143,19 @@ def generate_feature_sets(
         )
 
         for feature_set in generated_sets:
-            normalized_set = normalize_feature_set(feature_set, max_features=max_features)
-            normalized_set.validate(
-                expected_train_rows=len(bundle.train),
-                expected_test_rows=len(bundle.test),
-            )
+            try:
+                normalized_set = normalize_feature_set(feature_set, max_features=max_features)
+                normalized_set.validate(
+                    expected_train_rows=len(bundle.train),
+                    expected_test_rows=len(bundle.test),
+                )
+            except Exception as error:
+                logger.warning(
+                    "Skipping invalid feature set: name=%s error=%s",
+                    getattr(feature_set, "name", "<unknown>"),
+                    error,
+                )
+                continue
             if normalized_set.train_features.empty:
                 continue
             feature_sets.append(normalized_set)
@@ -160,12 +185,16 @@ def select_best_feature_set(
         random_seed=DEFAULT_CONFIG.random_seed,
     )
     target = bundle.train[bundle.target_column]
-    return evaluator.select_best(
-        feature_sets=feature_sets,
-        target=target,
-        runtime_budget=runtime_budget,
-        min_seconds_per_candidate_eval=DEFAULT_CONFIG.min_seconds_per_candidate_eval,
-    )
+    try:
+        return evaluator.select_best(
+            feature_sets=feature_sets,
+            target=target,
+            runtime_budget=runtime_budget,
+            min_seconds_per_candidate_eval=DEFAULT_CONFIG.min_seconds_per_candidate_eval,
+        )
+    except Exception as error:
+        logger.warning("Evaluator failed, using proxy fallback selector: %s", error)
+        return select_best_feature_set_fallback(feature_sets=feature_sets, target=target)
 
 
 def normalize_feature_set(feature_set: FeatureSet, max_features: int) -> FeatureSet:
@@ -194,3 +223,65 @@ def build_fallback_feature_set(bundle: DataBundle) -> FeatureSet:
         test_features=test_features,
         description="Fallback deterministic feature from id hash.",
     )
+
+
+def select_best_feature_set_fallback(
+    feature_sets: list[FeatureSet],
+    target: pd.Series,
+) -> tuple[FeatureSet, list[FeatureSetScore]]:
+    if not feature_sets:
+        raise ValueError("No feature sets available for fallback selection.")
+
+    scores: list[FeatureSetScore] = []
+    started_at = time.perf_counter()
+    for feature_set in feature_sets:
+        proxy_score = score_feature_set_proxy(feature_set.train_features, target)
+        scores.append(
+            FeatureSetScore(
+                feature_set_name=feature_set.name,
+                score=proxy_score,
+                n_features=feature_set.train_features.shape[1],
+                elapsed_sec=0.0,
+            )
+        )
+
+    best_score = max(scores, key=lambda score: (score.score, -score.n_features))
+    elapsed_total = time.perf_counter() - started_at
+    for score in scores:
+        score.elapsed_sec = elapsed_total / max(len(scores), 1)
+
+    best_feature_set = next(
+        feature_set for feature_set in feature_sets if feature_set.name == best_score.feature_set_name
+    )
+    return best_feature_set, scores
+
+
+def score_feature_set_proxy(features: pd.DataFrame, target: pd.Series) -> float:
+    if features.empty:
+        return 0.0
+
+    y = pd.Series(target).reset_index(drop=True)
+    if y.nunique(dropna=True) < 2:
+        return 0.5
+
+    signals: list[float] = []
+    for column in features.columns:
+        series = features[column].reset_index(drop=True)
+        if series.nunique(dropna=True) < 2:
+            continue
+
+        if pd.api.types.is_numeric_dtype(series):
+            x = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(-999.0)
+        else:
+            x = pd.Series(pd.factorize(series.fillna("__nan__").astype(str))[0], index=series.index)
+
+        try:
+            auc = roc_auc_score(y, x)
+            signals.append(abs(float(auc) - 0.5))
+        except Exception:
+            continue
+
+    if not signals:
+        return 0.5
+    mean_signal = float(np.mean(signals))
+    return max(0.0, min(1.0, 0.5 + mean_signal))
