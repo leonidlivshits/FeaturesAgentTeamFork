@@ -39,7 +39,7 @@ class MissingnessGenerator:
             column
             for column in usable_cols
             if pd.api.types.is_object_dtype(train_base[column])
-            or pd.api.types.is_categorical_dtype(train_base[column])
+            or isinstance(train_base[column].dtype, pd.CategoricalDtype)
         ]
         if object_cols:
             train_lengths = train_base[object_cols].fillna("").astype(str).apply(lambda col: col.str.len())

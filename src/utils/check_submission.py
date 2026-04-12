@@ -16,8 +16,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT / "data"
-OUTPUT_DIR = ROOT / "output"
+DATA_DIR = Path(os.getenv("FEATURES_AGENT_DATA_DIR", str(ROOT / "data"))).resolve()
+OUTPUT_DIR = Path(os.getenv("FEATURES_AGENT_OUTPUT_DIR", str(ROOT / "output"))).resolve()
 PYPROJECT_PATH = ROOT / "pyproject.toml"
 RUN_PATH = ROOT / "run.py"
 ENV_PATH = ROOT / ".env"
