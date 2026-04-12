@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 CATBOOST_SELECTION_PARAMS = {
-    "iterations": 120,
+    "iterations": 80,
     "learning_rate": 0.07,
-    "depth": 5,
+    "depth": 4,
     "l2_leaf_reg": 3,
     "random_seed": DEFAULT_CONFIG.random_seed,
     "verbose": 0,
@@ -260,7 +260,7 @@ class CatBoostFeatureSelector:
         class_counts = y.value_counts()
         min_class_count = int(class_counts.min()) if not class_counts.empty else 0
         n_splits = max(2, min(self.cv_folds, min_class_count)) if min_class_count >= 2 else 2
-        if len(y) >= 200_000:
+        if len(y) >= 120_000:
             if groups is not None:
                 group_series = pd.Series(groups).reset_index(drop=True)
                 if group_series.nunique(dropna=True) >= 20:
@@ -272,8 +272,8 @@ class CatBoostFeatureSelector:
                 StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=self.random_seed),
                 "stratified_holdout",
             )
-        elif len(y) >= 80_000:
-            n_splits = min(n_splits, 4)
+        elif len(y) >= 40_000:
+            n_splits = min(n_splits, 3)
 
         if groups is not None:
             group_series = pd.Series(groups).reset_index(drop=True)
@@ -362,17 +362,17 @@ class CatBoostFeatureSelector:
 
     @staticmethod
     def _search_width(round_idx: int, total_remaining: int) -> int:
-        if total_remaining >= 16:
+        if total_remaining >= 12:
             if round_idx <= 1:
-                return min(total_remaining, 4)
-            if round_idx == 2:
                 return min(total_remaining, 3)
+            if round_idx == 2:
+                return min(total_remaining, 2)
             return min(total_remaining, 2)
         if round_idx <= 1:
-            return min(total_remaining, 8)
+            return min(total_remaining, 5)
         if round_idx == 2:
-            return min(total_remaining, 6)
-        return min(total_remaining, 4)
+            return min(total_remaining, 3)
+        return min(total_remaining, 2)
 
     @staticmethod
     def _rank_tuple(item: tuple[FeatureCandidate, float, float, dict[str, Any]]) -> tuple[float, float, float, float, float, str]:
