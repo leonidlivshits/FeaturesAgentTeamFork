@@ -70,6 +70,39 @@ def is_llm_available() -> bool:
     return get_effective_llm_provider() != "none"
 
 
+def validate_llm_configuration() -> None:
+    if _llm_disabled():
+        return
+
+    requested = (_env("LLM_PROVIDER") or DEFAULT_CONFIG.default_llm_provider).lower()
+    mode = (_env("FEATURES_AGENT_MODE") or "auto").lower()
+
+    if requested not in {"auto", "gigachat", "openrouter"}:
+        raise ValueError(f"Unsupported LLM_PROVIDER='{requested}'. Expected one of: auto, gigachat, openrouter.")
+
+    if requested == "gigachat":
+        if not _has_non_empty_env_value("GIGACHAT_CREDENTIALS"):
+            raise ValueError("LLM_PROVIDER=gigachat but GIGACHAT_CREDENTIALS is empty.")
+        if not _has_non_empty_env_value("GIGACHAT_SCOPE"):
+            raise ValueError("LLM_PROVIDER=gigachat but GIGACHAT_SCOPE is empty.")
+        if not _can_use_gigachat():
+            raise ValueError("LLM_PROVIDER=gigachat but langchain_gigachat is unavailable.")
+        return
+
+    if requested == "openrouter":
+        if not _has_non_empty_env_value("OPENROUTER_API_KEY"):
+            raise ValueError("LLM_PROVIDER=openrouter but OPENROUTER_API_KEY is empty.")
+        if not _can_use_openrouter():
+            raise ValueError("LLM_PROVIDER=openrouter but langchain_openai is unavailable. Run uv sync.")
+        return
+
+    if requested == "auto" and mode == "llm" and not is_llm_available():
+        raise ValueError(
+            "FEATURES_AGENT_MODE=llm but no LLM provider is available. "
+            "Set gigachat/openrouter credentials or switch mode."
+        )
+
+
 def get_gigachat_client(timeout: int = 25) -> Any | None:
     credentials = _env("GIGACHAT_CREDENTIALS")
     scope = _env("GIGACHAT_SCOPE")

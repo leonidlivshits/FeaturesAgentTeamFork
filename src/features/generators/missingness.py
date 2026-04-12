@@ -11,7 +11,7 @@ class MissingnessGenerator:
 
     def generate(self, bundle: DataBundle, max_features: int) -> list[FeatureSet]:
         exclude_cols = {bundle.id_column, bundle.target_column}
-        usable_cols = [column for column in bundle.train.columns if column not in exclude_cols]
+        usable_cols = sorted([column for column in bundle.train.columns if column not in exclude_cols])
         if not usable_cols:
             return []
 
@@ -61,4 +61,3 @@ class MissingnessGenerator:
                 description="Missingness and row-level profile features.",
             )
         ]
-

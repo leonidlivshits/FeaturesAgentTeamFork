@@ -35,7 +35,7 @@ def ensure_input_contract(data_dir: Path) -> None:
     if not data_dir.exists() or not data_dir.is_dir():
         raise FileNotFoundError(f"Missing data directory: {data_dir}")
 
-    required_files = ("train.csv", "test.csv")
+    required_files = ("train.csv", "test.csv", "readme.txt")
     for filename in required_files:
         file_path = data_dir / filename
         if not file_path.exists():

@@ -10,6 +10,7 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 from src.core.config import DATA_DIR, DEFAULT_CONFIG, OUTPUT_DIR
+from src.core.llm import validate_llm_configuration
 from src.core.runtime import RuntimeBudget, ensure_input_contract, ensure_output_contract, prepare_output_dir
 from src.data.loaders import DataBundle, load_data_bundle
 from src.evaluation.catboost_evaluator import CatBoostFeatureEvaluator, FeatureSetScore
@@ -34,6 +35,7 @@ class PipelineResult:
 
 def run_pipeline() -> PipelineResult:
     ensure_input_contract(DATA_DIR)
+    validate_llm_configuration()
     prepare_output_dir(OUTPUT_DIR)
     runtime_budget = RuntimeBudget(
         total_sec=DEFAULT_CONFIG.internal_time_budget_sec,
@@ -85,6 +87,10 @@ def run_pipeline() -> PipelineResult:
     decision_trace: dict[str, Any] = {
         "requested_mode": get_generator_mode(),
         "effective_mode": get_effective_generator_mode(),
+        "dataset_type": bundle.schema_context.dataset_profile.dataset_type,
+        "dataset_type_confidence": round(float(bundle.schema_context.dataset_profile.confidence), 3),
+        "schema_join_edges": len(bundle.schema_context.join_edges),
+        "schema_recommended_joins": dict(bundle.schema_context.recommended_joins),
         "candidate_sets_generated": len(feature_sets),
         "candidate_sets_evaluated": len(scores),
         "selected_feature_set": selected_feature_set.name,
@@ -134,6 +140,7 @@ def generate_feature_sets(
     runtime_budget: RuntimeBudget,
 ) -> list[FeatureSet]:
     feature_sets: list[FeatureSet] = []
+    seen_signatures: set[tuple[Any, ...]] = set()
     for generator in build_generators():
         if not runtime_budget.has_time(DEFAULT_CONFIG.min_seconds_per_generator):
             logger.warning(
@@ -161,6 +168,13 @@ def generate_feature_sets(
         for feature_set in generated_sets:
             try:
                 normalized_set = normalize_feature_set(feature_set, max_features=max_features)
+                normalized_set = remove_target_leakage(
+                    feature_set=normalized_set,
+                    target=bundle.train[bundle.target_column],
+                    target_column=bundle.target_column,
+                )
+                if normalized_set is None:
+                    continue
                 normalized_set.validate(
                     expected_train_rows=len(bundle.train),
                     expected_test_rows=len(bundle.test),
@@ -174,6 +188,16 @@ def generate_feature_sets(
                 continue
             if normalized_set.train_features.empty:
                 continue
+
+            signature = feature_set_signature(normalized_set)
+            if signature in seen_signatures:
+                logger.info(
+                    "Skipping duplicated/equivalent feature set: name=%s",
+                    normalized_set.name,
+                )
+                continue
+            seen_signatures.add(signature)
+
             feature_sets.append(normalized_set)
             if len(feature_sets) >= DEFAULT_CONFIG.max_candidate_feature_sets:
                 logger.warning(
@@ -196,6 +220,13 @@ def select_best_feature_set(
     bundle: DataBundle,
     runtime_budget: RuntimeBudget,
 ) -> tuple[FeatureSet, list[FeatureSetScore]]:
+    if not runtime_budget.has_time(DEFAULT_CONFIG.min_seconds_per_candidate_eval):
+        logger.warning(
+            "Not enough time for CatBoost evaluation. Using proxy fallback selector: remaining=%.2fs",
+            runtime_budget.remaining(),
+        )
+        return select_best_feature_set_fallback(feature_sets=feature_sets, target=bundle.train[bundle.target_column])
+
     evaluator = CatBoostFeatureEvaluator(
         cv_folds=DEFAULT_CONFIG.cv_folds,
         random_seed=DEFAULT_CONFIG.random_seed,
@@ -214,7 +245,7 @@ def select_best_feature_set(
 
 
 def normalize_feature_set(feature_set: FeatureSet, max_features: int) -> FeatureSet:
-    columns = list(feature_set.train_features.columns)[:max_features]
+    columns = sorted(list(feature_set.train_features.columns))[:max_features]
     train_features = feature_set.train_features[columns].copy()
     test_features = feature_set.test_features[columns].copy()
     return FeatureSet(
@@ -223,6 +254,101 @@ def normalize_feature_set(feature_set: FeatureSet, max_features: int) -> Feature
         test_features=test_features,
         description=feature_set.description,
         metadata=feature_set.metadata,
+    )
+
+
+def remove_target_leakage(
+    feature_set: FeatureSet,
+    target: pd.Series,
+    target_column: str,
+) -> FeatureSet | None:
+    safe_columns: list[str] = []
+    dropped_columns: list[str] = []
+
+    for column in feature_set.train_features.columns:
+        if _looks_like_target_feature(column=column, target_column=target_column):
+            dropped_columns.append(column)
+            continue
+        if _matches_target(feature_set.train_features[column], target):
+            dropped_columns.append(column)
+            continue
+        safe_columns.append(column)
+
+    if dropped_columns:
+        logger.warning(
+            "Leakage guard removed columns from feature set '%s': %s",
+            feature_set.name,
+            ", ".join(dropped_columns),
+        )
+
+    if not safe_columns:
+        logger.warning("All columns removed by leakage guard for feature set '%s'.", feature_set.name)
+        return None
+
+    metadata = dict(feature_set.metadata) if isinstance(feature_set.metadata, dict) else {}
+    if dropped_columns:
+        metadata["dropped_leaky_columns"] = dropped_columns
+
+    return FeatureSet(
+        name=feature_set.name,
+        train_features=feature_set.train_features[safe_columns].copy(),
+        test_features=feature_set.test_features[safe_columns].copy(),
+        description=feature_set.description,
+        metadata=metadata,
+    )
+
+
+def _looks_like_target_feature(column: str, target_column: str) -> bool:
+    normalized_column = column.strip().lower()
+    normalized_target = target_column.strip().lower()
+    if not normalized_column or not normalized_target:
+        return False
+    return normalized_target in normalized_column
+
+
+def _matches_target(feature: pd.Series, target: pd.Series) -> bool:
+    x = feature.reset_index(drop=True)
+    y = target.reset_index(drop=True)
+    if len(x) != len(y):
+        return False
+
+    x_str = x.fillna("__nan__").astype(str)
+    y_str = y.fillna("__nan__").astype(str)
+    if bool((x_str == y_str).all()):
+        return True
+
+    x_num = pd.to_numeric(x, errors="coerce")
+    y_num = pd.to_numeric(y, errors="coerce")
+    valid_mask = x_num.notna() & y_num.notna()
+    if int(valid_mask.sum()) == len(x_num):
+        return bool(np.allclose(x_num.to_numpy(), y_num.to_numpy(), rtol=0.0, atol=1e-12))
+
+    return False
+
+
+def feature_set_signature(feature_set: FeatureSet) -> tuple[Any, ...]:
+    column_signatures: list[tuple[str, int, int]] = []
+    for column in feature_set.train_features.columns:
+        series = feature_set.train_features[column]
+        if pd.api.types.is_numeric_dtype(series):
+            normalized = (
+                pd.to_numeric(series, errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(-999.0)
+                .round(8)
+            )
+        else:
+            normalized = series.fillna("__nan__").astype(str)
+        hashed = pd.util.hash_pandas_object(normalized, index=False)
+        hash_sum = int(hashed.sum())
+        nunique = int(normalized.nunique(dropna=False))
+        column_signatures.append((column, hash_sum, nunique))
+
+    # Include test shape to avoid accidental collisions when train signatures match.
+    return (
+        len(feature_set.train_features),
+        len(feature_set.test_features),
+        tuple(sorted(column_signatures, key=lambda item: item[0])),
     )
 
 

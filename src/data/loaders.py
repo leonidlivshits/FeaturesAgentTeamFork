@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.data.schema import SchemaContext, build_schema_context
+
 
 PREFERRED_ID_NAMES = (
     "id",
@@ -24,6 +26,7 @@ class DataBundle:
     data_readme: str
     id_column: str
     target_column: str
+    schema_context: SchemaContext
 
 
 def read_csv_auto(path: Path) -> pd.DataFrame:
@@ -46,6 +49,14 @@ def load_data_bundle(data_dir: Path) -> DataBundle:
     data_readme = readme_path.read_text(encoding="utf-8", errors="ignore") if readme_path.exists() else ""
 
     id_column, target_column = infer_key_columns(train=train, test=test)
+    schema_context = build_schema_context(
+        train=train,
+        test=test,
+        aux_tables=aux_tables,
+        readme_text=data_readme,
+        id_column=id_column,
+        target_column=target_column,
+    )
 
     return DataBundle(
         train=train,
@@ -54,6 +65,7 @@ def load_data_bundle(data_dir: Path) -> DataBundle:
         data_readme=data_readme,
         id_column=id_column,
         target_column=target_column,
+        schema_context=schema_context,
     )
 
 

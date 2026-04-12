@@ -42,15 +42,59 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_env_file(path: Path) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key:
+            parsed[key] = value
+    return parsed
+
+
+def parse_bool(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes"}
+
+
 def ensure_env_file() -> None:
     if not ENV_FILE.exists():
         raise FileNotFoundError(f"Missing required file: {ENV_FILE}")
 
-    content = ENV_FILE.read_text(encoding="utf-8", errors="ignore")
-    required = ("GIGACHAT_CREDENTIALS", "GIGACHAT_SCOPE")
-    missing = [key for key in required if key not in content]
-    if missing:
-        raise ValueError(f".env missing required keys: {missing}")
+    env_values = parse_env_file(ENV_FILE)
+    if parse_bool(env_values.get("FEATURES_AGENT_DISABLE_LLM")):
+        return
+
+    provider = (env_values.get("LLM_PROVIDER") or "auto").strip().lower()
+    mode = (env_values.get("FEATURES_AGENT_MODE") or "auto").strip().lower()
+    if provider not in {"auto", "gigachat", "openrouter"}:
+        raise ValueError("Unsupported LLM_PROVIDER in .env. Expected: auto|gigachat|openrouter")
+
+    if provider == "gigachat":
+        if not env_values.get("GIGACHAT_CREDENTIALS", "").strip():
+            raise ValueError("Empty GIGACHAT_CREDENTIALS in .env")
+        if not env_values.get("GIGACHAT_SCOPE", "").strip():
+            raise ValueError("Empty GIGACHAT_SCOPE in .env")
+        return
+
+    if provider == "openrouter":
+        if not env_values.get("OPENROUTER_API_KEY", "").strip():
+            raise ValueError("Empty OPENROUTER_API_KEY in .env")
+        return
+
+    if mode == "llm":
+        has_gigachat = bool(env_values.get("GIGACHAT_CREDENTIALS", "").strip()) and bool(
+            env_values.get("GIGACHAT_SCOPE", "").strip()
+        )
+        has_openrouter = bool(env_values.get("OPENROUTER_API_KEY", "").strip())
+        if not (has_gigachat or has_openrouter):
+            raise ValueError(
+                "FEATURES_AGENT_MODE=llm requires at least one configured provider: "
+                "GIGACHAT_CREDENTIALS+GIGACHAT_SCOPE or OPENROUTER_API_KEY"
+            )
 
 
 def run_local_checks() -> None:
@@ -119,4 +163,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

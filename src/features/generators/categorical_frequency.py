@@ -20,6 +20,7 @@ class CategoricalFrequencyGenerator:
                 or pd.api.types.is_categorical_dtype(bundle.train[column])
             )
         ]
+        categorical_cols = sorted(categorical_cols)
         categorical_cols = categorical_cols[:max_features]
         if not categorical_cols:
             return []
@@ -47,4 +48,3 @@ class CategoricalFrequencyGenerator:
                 description="Category frequency encoding from train distribution.",
             )
         ]
-

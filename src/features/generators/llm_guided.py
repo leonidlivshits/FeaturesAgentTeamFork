@@ -69,20 +69,24 @@ class LlmGuidedGenerator:
 
     def generate(self, bundle: DataBundle, max_features: int) -> list[FeatureSet]:
         train_context, test_context = self._build_feature_context(bundle)
-        common_columns = [
+        common_columns = sorted(
+            [
             column
             for column in train_context.columns
             if column in test_context.columns and column not in {bundle.id_column, bundle.target_column}
-        ]
+            ]
+        )
         if not common_columns:
             return []
 
-        numeric_columns = [
+        numeric_columns = sorted(
+            [
             column
             for column in common_columns
             if pd.api.types.is_numeric_dtype(train_context[column])
-        ]
-        categorical_columns = [column for column in common_columns if column not in numeric_columns]
+            ]
+        )
+        categorical_columns = sorted([column for column in common_columns if column not in numeric_columns])
         if not numeric_columns and not categorical_columns:
             return []
 
@@ -126,6 +130,7 @@ class LlmGuidedGenerator:
                 metadata={
                     "plan_source": plan_source,
                     "llm_provider": self.llm_provider,
+                    "dataset_type": bundle.schema_context.dataset_profile.dataset_type,
                     "selected_operations": selected_operations,
                     "selected_feature_scores": {column: selection_scores.get(column, 0.0) for column in selected_columns},
                     "candidate_plan_size": len(plan),
@@ -171,6 +176,7 @@ class LlmGuidedGenerator:
 
         prompt = self._build_prompt(
             data_readme=bundle.data_readme,
+            schema_summary=bundle.schema_context.to_prompt_summary(),
             numeric_columns=numeric_columns,
             categorical_columns=categorical_columns,
             max_features=max_features,
@@ -203,11 +209,13 @@ class LlmGuidedGenerator:
     @staticmethod
     def _build_prompt(
         data_readme: str,
+        schema_summary: str,
         numeric_columns: list[str],
         categorical_columns: list[str],
         max_features: int,
     ) -> str:
         readme_fragment = data_readme[:3000] if data_readme else "No data readme provided."
+        schema_fragment = schema_summary[:3200] if schema_summary else "No schema summary provided."
         numeric_preview = ", ".join(numeric_columns[:30]) if numeric_columns else "none"
         categorical_preview = ", ".join(categorical_columns[:30]) if categorical_columns else "none"
         return f"""
@@ -232,6 +240,9 @@ Constraints:
 
 Numeric columns: {numeric_preview}
 Categorical columns: {categorical_preview}
+
+Schema summary:
+{schema_fragment}
 
 Data readme:
 {readme_fragment}
@@ -418,36 +429,68 @@ Output schema:
         train_context = bundle.train.copy()
         test_context = bundle.test.copy()
 
-        for table_name, aux_df in bundle.aux_tables.items():
-            if bundle.id_column not in aux_df.columns:
+        for table_name in sorted(bundle.aux_tables.keys()):
+            aux_df = bundle.aux_tables[table_name]
+            join_key = self._pick_join_key(bundle=bundle, table_name=table_name, aux_df=aux_df)
+            if not join_key:
                 continue
             prepared_aux = self._prepare_aux_table(
                 aux_df=aux_df,
-                id_column=bundle.id_column,
+                join_key=join_key,
                 table_name=table_name,
+                forbidden_columns={bundle.target_column},
             )
             if prepared_aux.empty:
                 continue
 
-            train_context = train_context.merge(prepared_aux, on=bundle.id_column, how="left")
-            test_context = test_context.merge(prepared_aux, on=bundle.id_column, how="left")
+            train_context = train_context.merge(prepared_aux, on=join_key, how="left")
+            test_context = test_context.merge(prepared_aux, on=join_key, how="left")
 
         return train_context, test_context
 
     @staticmethod
-    def _prepare_aux_table(aux_df: pd.DataFrame, id_column: str, table_name: str) -> pd.DataFrame:
+    def _pick_join_key(bundle: DataBundle, table_name: str, aux_df: pd.DataFrame) -> str | None:
+        preferred = bundle.schema_context.recommended_joins.get(table_name)
+        if preferred and preferred in aux_df.columns:
+            return preferred
+
+        base_keys = sorted(set(bundle.train.columns) & set(bundle.test.columns))
+        candidates = [
+            column
+            for column in base_keys
+            if column in aux_df.columns and column not in {bundle.target_column}
+        ]
+        if not candidates:
+            return None
+        if bundle.id_column in candidates:
+            return bundle.id_column
+        return candidates[0]
+
+    @staticmethod
+    def _prepare_aux_table(
+        aux_df: pd.DataFrame,
+        join_key: str,
+        table_name: str,
+        forbidden_columns: set[str] | None = None,
+    ) -> pd.DataFrame:
         safe_prefix = table_name.replace(" ", "_").lower()
         working = aux_df.copy()
+        forbidden_normalized = {column.lower() for column in (forbidden_columns or set()) if column}
 
         renamed: dict[str, str] = {}
         for column in working.columns:
-            if column == id_column:
+            if column == join_key:
+                continue
+            if column.lower() in forbidden_normalized:
                 continue
             renamed[column] = f"{safe_prefix}__{column}"
-        working = working.rename(columns=renamed)
+        columns_to_keep = [join_key, *renamed.keys()]
+        working = working[columns_to_keep].rename(columns=renamed)
 
-        numeric_cols = [column for column in working.columns if column != id_column and pd.api.types.is_numeric_dtype(working[column])]
-        categorical_cols = [column for column in working.columns if column != id_column and column not in numeric_cols]
+        numeric_cols = sorted(
+            [column for column in working.columns if column != join_key and pd.api.types.is_numeric_dtype(working[column])]
+        )
+        categorical_cols = sorted([column for column in working.columns if column != join_key and column not in numeric_cols])
 
         if not numeric_cols and not categorical_cols:
             return pd.DataFrame()
@@ -458,11 +501,11 @@ Output schema:
         for column in categorical_cols:
             agg_spec[column] = "first"
 
-        grouped = working.groupby(id_column, dropna=False).agg(agg_spec).reset_index()
+        grouped = working.groupby(join_key, dropna=False).agg(agg_spec).reset_index()
         row_count = (
-            working.groupby(id_column, dropna=False).size().rename(f"{safe_prefix}__row_count").reset_index()
+            working.groupby(join_key, dropna=False).size().rename(f"{safe_prefix}__row_count").reset_index()
         )
-        grouped = grouped.merge(row_count, on=id_column, how="left")
+        grouped = grouped.merge(row_count, on=join_key, how="left")
         return grouped
 
     @staticmethod

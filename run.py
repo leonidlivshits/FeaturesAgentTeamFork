@@ -22,6 +22,8 @@ def main() -> None:
     print("ID column:", result.id_column)
     print("Target column:", result.target_column)
     print("Generator mode:", result.decision_trace.get("effective_mode", "n/a"))
+    print("Dataset type:", result.decision_trace.get("dataset_type", "n/a"))
+    print("Dataset type confidence:", result.decision_trace.get("dataset_type_confidence", "n/a"))
     print("Selected plan source:", result.decision_trace.get("selected_plan_source", "n/a"))
     print("Selected LLM provider:", result.decision_trace.get("selected_llm_provider", "n/a"))
     print("LLM was used:", result.decision_trace.get("llm_was_used", False))

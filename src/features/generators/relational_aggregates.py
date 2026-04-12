@@ -35,7 +35,12 @@ class RelationalAggregatesGenerator:
 
         for plan in join_plans:
             aux_df = bundle.aux_tables[plan.table_name]
-            aggregated = self._aggregate_aux_table(aux_df=aux_df, key_column=plan.key_column, table_prefix=plan.table_name)
+            aggregated = self._aggregate_aux_table(
+                aux_df=aux_df,
+                key_column=plan.key_column,
+                table_prefix=plan.table_name,
+                forbidden_columns={bundle.target_column},
+            )
             if aggregated.empty:
                 continue
 
@@ -68,6 +73,8 @@ class RelationalAggregatesGenerator:
                 metadata={
                     "tables_used": [plan.table_name for plan in join_plans],
                     "join_keys": {plan.table_name: plan.key_column for plan in join_plans},
+                    "dataset_type": bundle.schema_context.dataset_profile.dataset_type,
+                    "schema_recommended_joins": dict(bundle.schema_context.recommended_joins),
                     "join_scores": {
                         plan.table_name: {
                             "coverage": round(plan.coverage_score, 6),
@@ -84,9 +91,12 @@ class RelationalAggregatesGenerator:
         base_columns = set(bundle.train.columns) & set(bundle.test.columns)
         plans: list[JoinPlan] = []
         readme_text = (bundle.data_readme or "").lower()
+        recommended_joins = bundle.schema_context.recommended_joins
+        dictionary_hints = bundle.schema_context.column_descriptions
 
-        for table_name, aux_df in bundle.aux_tables.items():
-            common_cols = [column for column in aux_df.columns if column in base_columns]
+        for table_name in sorted(bundle.aux_tables.keys()):
+            aux_df = bundle.aux_tables[table_name]
+            common_cols = sorted([column for column in aux_df.columns if column in base_columns])
             if not common_cols:
                 continue
 
@@ -108,7 +118,15 @@ class RelationalAggregatesGenerator:
                     id_column=bundle.id_column,
                 )
                 prior = self._column_name_prior(column=column, id_column=bundle.id_column)
-                total = 0.72 * coverage + 0.20 * hint + 0.08 * prior
+                schema_bonus = 0.0
+                if recommended_joins.get(table_name) == column:
+                    schema_bonus += 0.35
+                if self._is_schema_supported_join(bundle=bundle, table_name=table_name, key_column=column):
+                    schema_bonus += 0.10
+                if self._dictionary_mentions_key(dictionary_hints, column):
+                    schema_bonus += 0.08
+
+                total = 0.62 * coverage + 0.18 * hint + 0.08 * prior + 0.12 * min(1.0, schema_bonus)
                 scored_candidates.append((column, coverage, hint, total))
 
             if not scored_candidates:
@@ -120,7 +138,8 @@ class RelationalAggregatesGenerator:
             )
 
             # Conservative gate: keep only meaningful join plans.
-            if coverage_score <= 0.03 and hint_score < 0.6:
+            is_schema_recommended = recommended_joins.get(table_name) == best_key
+            if coverage_score <= 0.03 and hint_score < 0.6 and not is_schema_recommended:
                 continue
             if total_score < 0.08:
                 continue
@@ -135,7 +154,26 @@ class RelationalAggregatesGenerator:
                 )
             )
 
-        return plans
+        return sorted(
+            plans,
+            key=lambda plan: (-plan.total_score, plan.table_name, plan.key_column),
+        )
+
+    @staticmethod
+    def _dictionary_mentions_key(column_descriptions: dict[str, str], key_column: str) -> bool:
+        description = column_descriptions.get(key_column.lower(), "").lower()
+        if not description:
+            return False
+        return any(marker in description for marker in ("идентификатор", "identifier", "foreign key", "ключ"))
+
+    @staticmethod
+    def _is_schema_supported_join(bundle: DataBundle, table_name: str, key_column: str) -> bool:
+        for edge in bundle.schema_context.join_edges:
+            if edge.left_table == "train" and edge.right_table == table_name and edge.left_key == key_column:
+                return True
+            if edge.right_table == "train" and edge.left_table == table_name and edge.right_key == key_column:
+                return True
+        return False
 
     @staticmethod
     def _join_coverage_score(base_values: pd.Series, aux_values: pd.Series) -> float:
@@ -227,23 +265,38 @@ class RelationalAggregatesGenerator:
         }
         return [variant for variant in variants if variant]
 
-    def _aggregate_aux_table(self, aux_df: pd.DataFrame, key_column: str, table_prefix: str) -> pd.DataFrame:
+    def _aggregate_aux_table(
+        self,
+        aux_df: pd.DataFrame,
+        key_column: str,
+        table_prefix: str,
+        forbidden_columns: set[str] | None = None,
+    ) -> pd.DataFrame:
         if key_column not in aux_df.columns:
             return pd.DataFrame()
 
         safe_prefix = table_prefix.replace(" ", "_").lower()
         working = aux_df.copy()
+        forbidden_normalized = {column.lower() for column in (forbidden_columns or set()) if column}
 
-        numeric_cols = [
+        numeric_cols = sorted(
+            [
             column
             for column in working.columns
-            if column != key_column and pd.api.types.is_numeric_dtype(working[column])
-        ][:4]
-        categorical_cols = [
+            if column != key_column
+            and column.lower() not in forbidden_normalized
+            and pd.api.types.is_numeric_dtype(working[column])
+            ]
+        )[:4]
+        categorical_cols = sorted(
+            [
             column
             for column in working.columns
-            if column != key_column and not pd.api.types.is_numeric_dtype(working[column])
-        ][:2]
+            if column != key_column
+            and column.lower() not in forbidden_normalized
+            and not pd.api.types.is_numeric_dtype(working[column])
+            ]
+        )[:2]
 
         aggs: dict[str, list[str]] = {}
         for column in numeric_cols:

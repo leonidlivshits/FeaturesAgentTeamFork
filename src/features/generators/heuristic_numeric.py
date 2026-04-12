@@ -17,6 +17,7 @@ class NumericHeuristicGenerator:
             for column in bundle.train.columns
             if column not in exclude_cols and pd.api.types.is_numeric_dtype(bundle.train[column])
         ]
+        numeric_cols = sorted(numeric_cols)
         if not numeric_cols:
             return []
 
@@ -81,4 +82,3 @@ class NumericHeuristicGenerator:
             feature_set.test_features = feature_set.test_features.replace([np.inf, -np.inf], np.nan)
 
         return feature_sets
-

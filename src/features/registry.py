@@ -7,6 +7,7 @@ from src.core.config import DEFAULT_CONFIG
 from src.core.llm import is_llm_available
 from src.features.contracts import FeatureGenerator
 from src.features.generators.categorical_frequency import CategoricalFrequencyGenerator
+from src.features.generators.deposit_domain import DepositDomainGenerator
 from src.features.generators.heuristic_numeric import NumericHeuristicGenerator
 from src.features.generators.llm_guided import LlmGuidedGenerator
 from src.features.generators.missingness import MissingnessGenerator
@@ -37,6 +38,7 @@ def build_generators() -> list[FeatureGenerator]:
 
     heuristic_generators: list[FeatureGenerator] = [
         NumericHeuristicGenerator(),
+        DepositDomainGenerator(),
         RelationalAggregatesGenerator(),
         CategoricalFrequencyGenerator(),
         MissingnessGenerator(),
