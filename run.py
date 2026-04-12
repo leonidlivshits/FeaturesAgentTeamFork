@@ -21,12 +21,14 @@ def main() -> None:
     print("Generated features:", result.generated_feature_count)
     print("ID column:", result.id_column)
     print("Target column:", result.target_column)
-    print("Generator mode:", result.decision_trace.get("effective_mode", "n/a"))
-    print("Selected plan source:", result.decision_trace.get("selected_plan_source", "n/a"))
-    print("Selected LLM provider:", result.decision_trace.get("selected_llm_provider", "n/a"))
-    print("LLM was used:", result.decision_trace.get("llm_was_used", False))
-    print("LLM candidate sets:", result.decision_trace.get("llm_candidate_sets", 0))
-    print("LLM providers seen:", ", ".join(result.decision_trace.get("llm_providers_seen", ["n/a"])))
+    print("Dataset type:", result.decision_trace.get("dataset_type", "n/a"))
+    print("Group column:", result.decision_trace.get("group_column", "n/a"))
+    print("Time column:", result.decision_trace.get("time_column", "n/a"))
+    print("Candidate pool size:", result.decision_trace.get("candidate_pool_size", 0))
+    print("CV strategy:", result.decision_trace.get("cv_strategy", "n/a"))
+    print("Selected families:", ", ".join(result.decision_trace.get("selected_feature_families", [])))
+    print("LLM candidate count:", result.decision_trace.get("llm_candidate_count", 0))
+    print("LLM in final:", result.decision_trace.get("llm_in_final", False))
 
 
 if __name__ == "__main__":

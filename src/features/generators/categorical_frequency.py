@@ -17,7 +17,7 @@ class CategoricalFrequencyGenerator:
             if column not in exclude_cols
             and (
                 pd.api.types.is_object_dtype(bundle.train[column])
-                or pd.api.types.is_categorical_dtype(bundle.train[column])
+                or isinstance(bundle.train[column].dtype, pd.CategoricalDtype)
             )
         ]
         categorical_cols = categorical_cols[:max_features]
@@ -47,4 +47,3 @@ class CategoricalFrequencyGenerator:
                 description="Category frequency encoding from train distribution.",
             )
         ]
-

@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
 
 from src.core.config import DATA_DIR, DEFAULT_CONFIG, OUTPUT_DIR
 from src.core.runtime import RuntimeBudget, ensure_input_contract, ensure_output_contract, prepare_output_dir
-from src.data.loaders import DataBundle, load_data_bundle
-from src.evaluation.catboost_evaluator import CatBoostFeatureEvaluator, FeatureSetScore
-from src.features.contracts import FeatureSet
-from src.features.registry import build_generators, get_effective_generator_mode, get_generator_mode
+from src.data.loaders import load_data_bundle
+from src.evaluation.feature_selector import CatBoostFeatureSelector, SelectionResult
+from src.features.contracts import FeatureCandidate, FeatureSet
+from src.features.factory import SchemaAwareFeatureFactory
 from src.io.contracts import validate_output_contract
 from src.io.writer import write_submission
+from src.schema.profiler import build_dataset_profile
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +26,7 @@ class PipelineResult:
     generated_feature_count: int
     id_column: str
     target_column: str
-    all_scores: list[FeatureSetScore]
+    all_scores: list[dict[str, Any]]
     decision_trace: dict[str, Any]
 
 
@@ -41,21 +39,51 @@ def run_pipeline() -> PipelineResult:
     )
 
     bundle = load_data_bundle(DATA_DIR)
-    feature_sets = generate_feature_sets(
+    profile = build_dataset_profile(bundle)
+    feature_factory = SchemaAwareFeatureFactory()
+    candidates = feature_factory.generate_candidates(
         bundle=bundle,
-        max_features=DEFAULT_CONFIG.max_features,
+        profile=profile,
         runtime_budget=runtime_budget,
     )
-    selected_feature_set, scores = select_best_feature_set(
-        feature_sets=feature_sets,
-        bundle=bundle,
-        runtime_budget=runtime_budget,
+    if not candidates:
+        candidates = [build_fallback_candidate(bundle)]
+
+    groups = None
+    if profile.group_column and profile.group_column in bundle.train.columns:
+        group_series = bundle.train[profile.group_column]
+        if group_series.nunique(dropna=True) < len(group_series):
+            groups = group_series
+
+    selector = CatBoostFeatureSelector(
+        cv_folds=DEFAULT_CONFIG.cv_folds,
+        random_seed=DEFAULT_CONFIG.random_seed,
     )
+    try:
+        selection_result = selector.select_best(
+            candidates=candidates,
+            target=bundle.train[bundle.target_column],
+            max_features=DEFAULT_CONFIG.max_features,
+            groups=groups,
+            runtime_budget=runtime_budget,
+            min_seconds_per_eval=DEFAULT_CONFIG.min_seconds_per_candidate_eval,
+            max_candidates=DEFAULT_CONFIG.max_candidate_pool_size,
+        )
+    except Exception as error:
+        logger.warning("Selection failed, using fallback candidate: %s", error)
+        selection_result = SelectionResult(
+            feature_set=build_fallback_candidate(bundle).to_feature_set(),
+            selected_candidates=[build_fallback_candidate(bundle)],
+            mean_auc=0.5,
+            std_auc=0.0,
+            cv_strategy="fallback",
+            fallback_reason="selection_failure",
+        )
 
     output_train_path, output_test_path = write_submission(
         train_base=bundle.train,
         test_base=bundle.test,
-        selected_feature_set=selected_feature_set,
+        selected_feature_set=selection_result.feature_set,
         output_dir=OUTPUT_DIR,
     )
     validate_output_contract(
@@ -67,237 +95,62 @@ def run_pipeline() -> PipelineResult:
     )
     ensure_output_contract(OUTPUT_DIR)
 
-    score_lookup = {score.feature_set_name: score for score in scores}
-    best_score = score_lookup.get(selected_feature_set.name, max(scores, key=lambda score: score.score))
-    selected_metadata = selected_feature_set.metadata if isinstance(selected_feature_set.metadata, dict) else {}
-    llm_candidate_sets = [
-        feature_set
-        for feature_set in feature_sets
-        if isinstance(feature_set.metadata, dict) and feature_set.metadata.get("plan_source") == "llm"
-    ]
-    llm_providers_seen = sorted(
-        {
-            str(feature_set.metadata.get("llm_provider"))
-            for feature_set in feature_sets
-            if isinstance(feature_set.metadata, dict) and feature_set.metadata.get("llm_provider")
-        }
-    )
+    selected_families = [candidate.source_family for candidate in selection_result.selected_candidates]
+    llm_in_final = any(candidate.source_family == "llm_planner" for candidate in selection_result.selected_candidates)
+    llm_candidates = [candidate for candidate in candidates if candidate.source_family == "llm_planner"]
     decision_trace: dict[str, Any] = {
-        "requested_mode": get_generator_mode(),
-        "effective_mode": get_effective_generator_mode(),
-        "candidate_sets_generated": len(feature_sets),
-        "candidate_sets_evaluated": len(scores),
-        "selected_feature_set": selected_feature_set.name,
-        "selected_cv_auc": round(float(best_score.score), 6),
-        "selected_n_features": int(selected_feature_set.train_features.shape[1]),
-        "selected_plan_source": selected_metadata.get("plan_source", "n/a"),
-        "selected_llm_provider": selected_metadata.get("llm_provider", "n/a"),
-        "llm_candidate_sets": len(llm_candidate_sets),
-        "llm_was_used": bool(llm_candidate_sets),
-        "llm_providers_seen": llm_providers_seen or ["n/a"],
+        "dataset_type": profile.dataset_type,
+        "group_column": profile.group_column or "n/a",
+        "time_column": profile.time_column or "n/a",
+        "candidate_pool_size": len(candidates),
+        "selected_feature_set": selection_result.feature_set.name,
+        "selected_cv_auc": round(float(selection_result.mean_auc), 6),
+        "selected_cv_std": round(float(selection_result.std_auc), 6),
+        "selected_n_features": int(selection_result.feature_set.train_features.shape[1]),
+        "selected_feature_families": selected_families,
+        "cv_strategy": selection_result.cv_strategy,
+        "fallback_reason": selection_result.fallback_reason or "n/a",
+        "llm_candidate_count": len(llm_candidates),
+        "llm_in_final": llm_in_final,
+        "tables_profiled": sorted(profile.table_profiles),
+        "join_plan_count": len(profile.join_plans),
     }
-    ranked_scores = sorted(scores, key=lambda score: score.score, reverse=True)
-    for rank, score in enumerate(ranked_scores, start=1):
-        logger.info(
-            "Candidate rank #%s: name=%s auc=%.6f features=%s elapsed=%.2fs",
-            rank,
-            score.feature_set_name,
-            score.score,
-            score.n_features,
-            score.elapsed_sec,
-        )
 
     logger.info(
-        "Pipeline finished: best=%s auc=%.6f features=%s elapsed=%.2fs remaining=%.2fs",
-        selected_feature_set.name,
-        best_score.score,
-        selected_feature_set.train_features.shape[1],
-        runtime_budget.elapsed(),
+        "Pipeline finished: dataset_type=%s best_auc=%.6f std=%.6f features=%s remaining=%.2fs",
+        profile.dataset_type,
+        selection_result.mean_auc,
+        selection_result.std_auc,
+        selection_result.feature_set.train_features.shape[1],
         runtime_budget.remaining(),
     )
     logger.info("Decision trace: %s", decision_trace)
 
     return PipelineResult(
-        best_feature_set=selected_feature_set.name,
-        best_cv_auc=best_score.score,
-        generated_feature_count=selected_feature_set.train_features.shape[1],
+        best_feature_set=selection_result.feature_set.name,
+        best_cv_auc=selection_result.mean_auc,
+        generated_feature_count=selection_result.feature_set.train_features.shape[1],
         id_column=bundle.id_column,
         target_column=bundle.target_column,
-        all_scores=scores,
+        all_scores=selection_result.selection_trace,
         decision_trace=decision_trace,
     )
 
 
-def generate_feature_sets(
-    bundle: DataBundle,
-    max_features: int,
-    runtime_budget: RuntimeBudget,
-) -> list[FeatureSet]:
-    feature_sets: list[FeatureSet] = []
-    for generator in build_generators():
-        if not runtime_budget.has_time(DEFAULT_CONFIG.min_seconds_per_generator):
-            logger.warning(
-                "Stopping generators due runtime budget: generated=%s remaining=%.2fs",
-                len(feature_sets),
-                runtime_budget.remaining(),
-            )
-            break
-
-        started_at = time.perf_counter()
-        try:
-            generated_sets = generator.generate(bundle=bundle, max_features=max_features)
-        except Exception as error:
-            logger.exception("Generator failed: %s", error)
-            continue
-        elapsed_sec = time.perf_counter() - started_at
-        logger.info(
-            "Generator completed: name=%s produced_sets=%s elapsed=%.2fs remaining=%.2fs",
-            getattr(generator, "name", generator.__class__.__name__),
-            len(generated_sets),
-            elapsed_sec,
-            runtime_budget.remaining(),
-        )
-
-        for feature_set in generated_sets:
-            try:
-                normalized_set = normalize_feature_set(feature_set, max_features=max_features)
-                normalized_set.validate(
-                    expected_train_rows=len(bundle.train),
-                    expected_test_rows=len(bundle.test),
-                )
-            except Exception as error:
-                logger.warning(
-                    "Skipping invalid feature set: name=%s error=%s",
-                    getattr(feature_set, "name", "<unknown>"),
-                    error,
-                )
-                continue
-            if normalized_set.train_features.empty:
-                continue
-            feature_sets.append(normalized_set)
-            if len(feature_sets) >= DEFAULT_CONFIG.max_candidate_feature_sets:
-                logger.warning(
-                    "Reached candidate cap=%s, stopping generation.",
-                    DEFAULT_CONFIG.max_candidate_feature_sets,
-                )
-                break
-        if len(feature_sets) >= DEFAULT_CONFIG.max_candidate_feature_sets:
-            break
-
-    if not feature_sets:
-        fallback = build_fallback_feature_set(bundle=bundle)
-        feature_sets.append(fallback)
-
-    return feature_sets
-
-
-def select_best_feature_set(
-    feature_sets: list[FeatureSet],
-    bundle: DataBundle,
-    runtime_budget: RuntimeBudget,
-) -> tuple[FeatureSet, list[FeatureSetScore]]:
-    evaluator = CatBoostFeatureEvaluator(
-        cv_folds=DEFAULT_CONFIG.cv_folds,
-        random_seed=DEFAULT_CONFIG.random_seed,
-    )
-    target = bundle.train[bundle.target_column]
-    try:
-        return evaluator.select_best(
-            feature_sets=feature_sets,
-            target=target,
-            runtime_budget=runtime_budget,
-            min_seconds_per_candidate_eval=DEFAULT_CONFIG.min_seconds_per_candidate_eval,
-        )
-    except Exception as error:
-        logger.warning("Evaluator failed, using proxy fallback selector: %s", error)
-        return select_best_feature_set_fallback(feature_sets=feature_sets, target=target)
-
-
-def normalize_feature_set(feature_set: FeatureSet, max_features: int) -> FeatureSet:
-    columns = list(feature_set.train_features.columns)[:max_features]
-    train_features = feature_set.train_features[columns].copy()
-    test_features = feature_set.test_features[columns].copy()
-    return FeatureSet(
-        name=feature_set.name,
-        train_features=train_features,
-        test_features=test_features,
-        description=feature_set.description,
-        metadata=feature_set.metadata,
-    )
-
-
-def build_fallback_feature_set(bundle: DataBundle) -> FeatureSet:
+def build_fallback_candidate(bundle) -> FeatureCandidate:
     train_hash = pd.util.hash_pandas_object(bundle.train[bundle.id_column], index=False).astype("uint64")
     test_hash = pd.util.hash_pandas_object(bundle.test[bundle.id_column], index=False).astype("uint64")
-
-    train_features = pd.DataFrame({"gen_id_hash": (train_hash % 100000).astype("float64") / 100000.0})
-    test_features = pd.DataFrame({"gen_id_hash": (test_hash % 100000).astype("float64") / 100000.0})
-
-    return FeatureSet(
-        name="fallback_id_hash",
-        train_features=train_features,
-        test_features=test_features,
-        description="Fallback deterministic feature from id hash.",
+    return FeatureCandidate(
+        name="gen_id_hash",
+        train_feature=(train_hash % 100000).astype("float64") / 100000.0,
+        test_feature=(test_hash % 100000).astype("float64") / 100000.0,
+        source_family="fallback",
+        proxy_score=0.0,
+        missing_ratio=0.0,
+        compute_cost=0.01,
+        metadata={"join_complexity": 0.0},
     )
 
 
-def select_best_feature_set_fallback(
-    feature_sets: list[FeatureSet],
-    target: pd.Series,
-) -> tuple[FeatureSet, list[FeatureSetScore]]:
-    if not feature_sets:
-        raise ValueError("No feature sets available for fallback selection.")
-
-    scores: list[FeatureSetScore] = []
-    started_at = time.perf_counter()
-    for feature_set in feature_sets:
-        proxy_score = score_feature_set_proxy(feature_set.train_features, target)
-        scores.append(
-            FeatureSetScore(
-                feature_set_name=feature_set.name,
-                score=proxy_score,
-                n_features=feature_set.train_features.shape[1],
-                elapsed_sec=0.0,
-            )
-        )
-
-    best_score = max(scores, key=lambda score: (score.score, -score.n_features))
-    elapsed_total = time.perf_counter() - started_at
-    for score in scores:
-        score.elapsed_sec = elapsed_total / max(len(scores), 1)
-
-    best_feature_set = next(
-        feature_set for feature_set in feature_sets if feature_set.name == best_score.feature_set_name
-    )
-    return best_feature_set, scores
-
-
-def score_feature_set_proxy(features: pd.DataFrame, target: pd.Series) -> float:
-    if features.empty:
-        return 0.0
-
-    y = pd.Series(target).reset_index(drop=True)
-    if y.nunique(dropna=True) < 2:
-        return 0.5
-
-    signals: list[float] = []
-    for column in features.columns:
-        series = features[column].reset_index(drop=True)
-        if series.nunique(dropna=True) < 2:
-            continue
-
-        if pd.api.types.is_numeric_dtype(series):
-            x = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(-999.0)
-        else:
-            x = pd.Series(pd.factorize(series.fillna("__nan__").astype(str))[0], index=series.index)
-
-        try:
-            auc = roc_auc_score(y, x)
-            signals.append(abs(float(auc) - 0.5))
-        except Exception:
-            continue
-
-    if not signals:
-        return 0.5
-    mean_signal = float(np.mean(signals))
-    return max(0.0, min(1.0, 0.5 + mean_signal))
+def build_fallback_feature_set(bundle) -> FeatureSet:
+    return build_fallback_candidate(bundle).to_feature_set()
