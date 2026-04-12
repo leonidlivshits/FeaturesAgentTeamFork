@@ -14,4 +14,6 @@ uv.lock
 .idea/
 .ipynb_checkpoints/
 output/*
+.features_agent_cache/
+catboost_info/
 .env

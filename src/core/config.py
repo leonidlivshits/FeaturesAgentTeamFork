@@ -25,8 +25,13 @@ class RuntimeConfig:
     min_seconds_per_generator: int = 8
     min_seconds_per_candidate_eval: int = 12
     max_candidate_feature_sets: int = 10
-    max_candidate_pool_size: int = 20
-    llm_plan_max_attempts: int = 3
+    max_candidate_pool_size: int = 16
+    llm_plan_max_attempts: int = 2
+    holdout_repeats: int = 2
+    holdout_seed_stride: int = 37
+    selection_family_repeat_penalty: float = 0.0015
+    selection_min_features: int = 3
+    selection_forced_max_drop: float = 0.003
     llm_self_consistency_plans: int = 3
     llm_char_budget_per_run: int = 50000
     llm_min_chars_per_attempt: int = 800

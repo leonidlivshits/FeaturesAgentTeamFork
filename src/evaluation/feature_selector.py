@@ -41,6 +41,7 @@ class SelectionResult:
     cv_strategy: str
     selection_trace: list[dict[str, Any]] = field(default_factory=list)
     fallback_reason: str = ""
+    effective_auc: float = 0.0
 
 
 class CatBoostFeatureSelector:
@@ -111,6 +112,7 @@ class CatBoostFeatureSelector:
         splitter, cv_strategy = self._build_splitter(target=target, groups=groups)
         selected: list[FeatureCandidate] = []
         selected_mean = 0.5
+        selected_effective = 0.5
         selected_std = math.inf
         trace: list[dict[str, Any]] = []
         remaining = pruned.copy()
@@ -144,12 +146,20 @@ class CatBoostFeatureSelector:
                     cv_strategy=cv_strategy,
                 )
                 elapsed = time.perf_counter() - started_at
+                family_repeat_count = sum(1 for item in selected if item.source_family == candidate.source_family)
+                penalized_repeat_count = max(0, family_repeat_count - 1)
+                family_penalty = float(DEFAULT_CONFIG.selection_family_repeat_penalty) * penalized_repeat_count
+                effective_auc = float(mean_auc - family_penalty)
                 eval_trace = {
                     "round": round_idx,
                     "candidate": candidate.name,
                     "candidate_family": candidate.source_family,
                     "mean_auc": round(mean_auc, 6),
+                    "effective_auc": round(effective_auc, 6),
                     "std_auc": round(std_auc, 6),
+                    "family_repeat_count": family_repeat_count,
+                    "penalized_repeat_count": penalized_repeat_count,
+                    "family_penalty": round(family_penalty, 6),
                     "elapsed_sec": round(elapsed, 4),
                     "n_features": len(selected) + 1,
                     "search_width": search_width,
@@ -163,15 +173,22 @@ class CatBoostFeatureSelector:
                 break
 
             candidate, mean_auc, std_auc, eval_trace = round_best
-            improvement = mean_auc - selected_mean
+            effective_auc = float(eval_trace.get("effective_auc", mean_auc))
+            improvement = effective_auc - selected_effective
             if selected and improvement < 1e-4:
-                eval_trace["stopped"] = "no_material_improvement"
-                break
+                min_features = max(1, int(DEFAULT_CONFIG.selection_min_features))
+                forced_drop = float(DEFAULT_CONFIG.selection_forced_max_drop)
+                if len(selected) < min_features and mean_auc >= selected_mean - forced_drop:
+                    eval_trace["selected_under_min_features"] = True
+                else:
+                    eval_trace["stopped"] = "no_material_improvement"
+                    break
 
             eval_trace["selected"] = True
             selected.append(candidate)
             remaining = [item for item in remaining if item.name != candidate.name]
             selected_mean = mean_auc
+            selected_effective = effective_auc
             selected_std = std_auc
 
         fallback_reason = ""
@@ -185,6 +202,7 @@ class CatBoostFeatureSelector:
                 groups=groups,
                 cv_strategy=cv_strategy,
             )
+            selected_effective = selected_mean
 
         feature_set = self._to_feature_set(selected)
         return SelectionResult(
@@ -195,6 +213,7 @@ class CatBoostFeatureSelector:
             cv_strategy=cv_strategy,
             selection_trace=trace,
             fallback_reason=fallback_reason,
+            effective_auc=float(selected_effective),
         )
 
     def _normalize_candidate(self, candidate: FeatureCandidate, target: pd.Series) -> FeatureCandidate:
@@ -314,20 +333,49 @@ class CatBoostFeatureSelector:
         X, cat_indices = self._prepare_features(X)
 
         fold_scores: list[float] = []
-        if cv_strategy in {"stratified_group_kfold", "group_holdout"} and groups is not None:
-            split_args = (X, y, groups.reset_index(drop=True))
+        if cv_strategy == "group_holdout" and groups is not None:
+            group_series = groups.reset_index(drop=True)
+            repeat_count = max(1, int(DEFAULT_CONFIG.holdout_repeats))
+            for repeat_idx in range(repeat_count):
+                split_seed = self.random_seed + repeat_idx * int(DEFAULT_CONFIG.holdout_seed_stride)
+                holdout_splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=split_seed)
+                for train_idx, valid_idx in holdout_splitter.split(X, y, group_series):
+                    model = CatBoostClassifier(**CATBOOST_SELECTION_PARAMS)
+                    model.fit(
+                        X.iloc[train_idx],
+                        y.iloc[train_idx],
+                        cat_features=cat_indices or None,
+                    )
+                    probabilities = model.predict_proba(X.iloc[valid_idx])[:, 1]
+                    fold_scores.append(float(roc_auc_score(y.iloc[valid_idx], probabilities)))
+        elif cv_strategy == "stratified_holdout":
+            repeat_count = max(1, int(DEFAULT_CONFIG.holdout_repeats))
+            for repeat_idx in range(repeat_count):
+                split_seed = self.random_seed + repeat_idx * int(DEFAULT_CONFIG.holdout_seed_stride)
+                holdout_splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=split_seed)
+                for train_idx, valid_idx in holdout_splitter.split(X, y):
+                    model = CatBoostClassifier(**CATBOOST_SELECTION_PARAMS)
+                    model.fit(
+                        X.iloc[train_idx],
+                        y.iloc[train_idx],
+                        cat_features=cat_indices or None,
+                    )
+                    probabilities = model.predict_proba(X.iloc[valid_idx])[:, 1]
+                    fold_scores.append(float(roc_auc_score(y.iloc[valid_idx], probabilities)))
         else:
-            split_args = (X, y)
-        for split in splitter.split(*split_args):
-            train_idx, valid_idx = split
-            model = CatBoostClassifier(**CATBOOST_SELECTION_PARAMS)
-            model.fit(
-                X.iloc[train_idx],
-                y.iloc[train_idx],
-                cat_features=cat_indices or None,
-            )
-            probabilities = model.predict_proba(X.iloc[valid_idx])[:, 1]
-            fold_scores.append(float(roc_auc_score(y.iloc[valid_idx], probabilities)))
+            if cv_strategy == "stratified_group_kfold" and groups is not None:
+                split_args = (X, y, groups.reset_index(drop=True))
+            else:
+                split_args = (X, y)
+            for train_idx, valid_idx in splitter.split(*split_args):
+                model = CatBoostClassifier(**CATBOOST_SELECTION_PARAMS)
+                model.fit(
+                    X.iloc[train_idx],
+                    y.iloc[train_idx],
+                    cat_features=cat_indices or None,
+                )
+                probabilities = model.predict_proba(X.iloc[valid_idx])[:, 1]
+                fold_scores.append(float(roc_auc_score(y.iloc[valid_idx], probabilities)))
 
         if not fold_scores:
             return 0.5, 0.0
@@ -376,9 +424,11 @@ class CatBoostFeatureSelector:
 
     @staticmethod
     def _rank_tuple(item: tuple[FeatureCandidate, float, float, dict[str, Any]]) -> tuple[float, float, float, float, float, str]:
-        candidate, mean_auc, std_auc, _ = item
+        candidate, mean_auc, std_auc, eval_trace = item
+        effective_auc = float(eval_trace.get("effective_auc", mean_auc))
         join_complexity = float(candidate.metadata.get("join_complexity", 0.0))
         return (
+            float(effective_auc),
             float(mean_auc),
             -float(std_auc),
             -float(candidate.missing_ratio),

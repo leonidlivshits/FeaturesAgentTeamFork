@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
+import hashlib
+import json
 import logging
 import os
+from pathlib import Path
 import time
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from src.core.config import DEFAULT_CONFIG
+from src.core.config import DEFAULT_CONFIG, ROOT_DIR
 from src.core.json_utils import safe_json_load
 from src.core.llm import get_effective_llm_provider, get_llm_client
 from src.core.runtime import RuntimeBudget
@@ -107,6 +110,7 @@ class SchemaAwareFeatureFactory:
         elif profile.dataset_type == "repeat_purchase_like":
             candidates.extend(
                 self._generate_repeat_purchase_candidates(
+                    bundle=bundle,
                     train_df=train_base,
                     test_df=test_base,
                     profile=profile,
@@ -354,6 +358,7 @@ class SchemaAwareFeatureFactory:
 
     def _generate_repeat_purchase_candidates(
         self,
+        bundle: DataBundle,
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
         profile: DatasetProfile,
@@ -397,6 +402,17 @@ class SchemaAwareFeatureFactory:
                     target=target,
                     used_names=used_names,
                     compute_cost=0.18,
+                )
+            )
+            candidates.extend(
+                self._generate_repeat_history_candidates(
+                    bundle=bundle,
+                    train_df=train_df,
+                    test_df=test_df,
+                    user_column=user_column,
+                    product_column=product_column,
+                    target=target,
+                    used_names=used_names,
                 )
             )
 
@@ -825,6 +841,113 @@ class SchemaAwareFeatureFactory:
         test_series = (test_df[group_column].fillna("__nan__").astype(str).map(max_time) - test_time).dt.days
         return train_series, test_series
 
+    def _generate_repeat_history_candidates(
+        self,
+        bundle: DataBundle,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        user_column: str,
+        product_column: str,
+        target: pd.Series,
+        used_names: set[str],
+    ) -> list[FeatureCandidate]:
+        orders_df = bundle.aux_tables.get("orders")
+        order_items_df = bundle.aux_tables.get("order_items")
+        if orders_df is None or order_items_df is None:
+            return []
+        if "order_id" not in orders_df.columns or "order_id" not in order_items_df.columns:
+            return []
+
+        product_column_items = product_column if product_column in order_items_df.columns else (
+            "product_id" if "product_id" in order_items_df.columns else None
+        )
+        if product_column_items is None:
+            return []
+
+        user_column_orders = user_column if user_column in orders_df.columns else self._find_column_by_tokens(
+            orders_df.columns,
+            ("user", "customer", "client", "account"),
+        )
+        if user_column_orders is None:
+            return []
+
+        orders_fit = orders_df.copy()
+        if "eval_set" in orders_fit.columns:
+            eval_series = orders_fit["eval_set"].astype(str).str.lower()
+            prior_mask = eval_series == "prior"
+            if prior_mask.any():
+                orders_fit = orders_fit[prior_mask]
+        order_columns = [column for column in ("order_id", user_column_orders, "order_number") if column in orders_fit.columns]
+        if len(order_columns) < 2:
+            return []
+
+        history = order_items_df.merge(orders_fit[order_columns], on="order_id", how="inner")
+        if history.empty:
+            return []
+
+        hist_user = history[user_column_orders].fillna("__nan__").astype(str)
+        hist_product = history[product_column_items].fillna("__nan__").astype(str)
+        hist_pair = hist_user + "||" + hist_product
+
+        train_user = train_df[user_column].fillna("__nan__").astype(str)
+        test_user = test_df[user_column].fillna("__nan__").astype(str)
+        train_product = train_df[product_column].fillna("__nan__").astype(str)
+        test_product = test_df[product_column].fillna("__nan__").astype(str)
+        train_pair = train_user + "||" + train_product
+        test_pair = test_user + "||" + test_product
+
+        pair_count = hist_pair.value_counts()
+        user_item_count = hist_user.value_counts()
+        product_item_count = hist_product.value_counts()
+
+        train_pair_count = train_pair.map(pair_count).fillna(0.0)
+        test_pair_count = test_pair.map(pair_count).fillna(0.0)
+        train_user_count = train_user.map(user_item_count).fillna(0.0)
+        test_user_count = test_user.map(user_item_count).fillna(0.0)
+        train_product_count = train_product.map(product_item_count).fillna(0.0)
+        test_product_count = test_product.map(product_item_count).fillna(0.0)
+
+        definitions: list[tuple[str, pd.Series, pd.Series]] = [
+            ("user_product_prior_count", train_pair_count, test_pair_count),
+            ("user_prior_items_count", train_user_count, test_user_count),
+            ("product_prior_items_count", train_product_count, test_product_count),
+            ("user_product_user_share", train_pair_count / (1.0 + train_user_count), test_pair_count / (1.0 + test_user_count)),
+        ]
+
+        if "reordered" in history.columns:
+            reordered = pd.to_numeric(history["reordered"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+            pair_reordered_mean = pd.DataFrame({"pair": hist_pair, "reordered": reordered}).groupby("pair", dropna=False)["reordered"].mean()
+            definitions.append(
+                (
+                    "user_product_reordered_rate",
+                    train_pair.map(pair_reordered_mean).fillna(0.0),
+                    test_pair.map(pair_reordered_mean).fillna(0.0),
+                )
+            )
+
+        if "order_number" in history.columns:
+            history_order = pd.to_numeric(history["order_number"], errors="coerce")
+            pair_last_order = pd.DataFrame({"pair": hist_pair, "order_number": history_order}).groupby("pair", dropna=False)["order_number"].max()
+            user_last_order = pd.DataFrame({"user": hist_user, "order_number": history_order}).groupby("user", dropna=False)["order_number"].max()
+
+            train_user_last = train_user.map(user_last_order)
+            test_user_last = test_user.map(user_last_order)
+            train_pair_last = train_pair.map(pair_last_order)
+            test_pair_last = test_pair.map(pair_last_order)
+
+            train_pair_gap = (train_user_last - train_pair_last).fillna(train_user_last + 1.0).fillna(0.0)
+            test_pair_gap = (test_user_last - test_pair_last).fillna(test_user_last + 1.0).fillna(0.0)
+            definitions.append(("user_product_order_recency_gap", train_pair_gap, test_pair_gap))
+
+        return self._build_candidates(
+            definitions=definitions,
+            source_family="repeat_history",
+            target=target,
+            used_names=used_names,
+            compute_cost=0.24,
+            metadata={"join_complexity": 1.0, "history_source": "orders_order_items"},
+        )
+
     def _rank_numeric_columns(
         self,
         train_df: pd.DataFrame,
@@ -961,6 +1084,9 @@ class LlmCandidatePlanner:
         self.provider = get_effective_llm_provider()
         self.client = get_llm_client(timeout=25)
         self.is_available = self.provider != "none" and self.client is not None and os.getenv("FEATURES_AGENT_DISABLE_LLM", "0").strip() not in {"1", "true", "yes"}
+        self.disk_cache_enabled = os.getenv("FEATURES_AGENT_LLM_DISK_CACHE", "1").strip().lower() not in {"0", "false", "no"}
+        cache_dir_raw = os.getenv("FEATURES_AGENT_LLM_CACHE_DIR", "").strip()
+        self.cache_dir = Path(cache_dir_raw).expanduser() if cache_dir_raw else (ROOT_DIR / ".features_agent_cache" / "llm_plans")
 
     def generate_candidates(
         self,
@@ -987,14 +1113,37 @@ class LlmCandidatePlanner:
             categorical_columns=categorical_columns,
             top_heuristics=top_heuristics,
         )
+        cache_key = self._cache_key(provider=self.provider, prompt=prompt)
+        cached_specs = self._read_cached_specs(
+            cache_key=cache_key,
+            known_columns=set(common_columns),
+            numeric_columns=set(numeric_columns),
+            categorical_columns=set(categorical_columns),
+        )
+        if cached_specs:
+            logger.info("LLM disk cache hit: specs=%s key=%s", len(cached_specs), cache_key[:12])
+            cached_candidates = self._build_candidates_from_specs(
+                specs=cached_specs,
+                train_context=train_context,
+                test_context=test_context,
+                target=target,
+                used_names=used_names,
+            )
+            ranked_cached = sorted(cached_candidates, key=lambda item: (-float(item.proxy_score), float(item.compute_cost), item.name))
+            return ranked_cached[: DEFAULT_CONFIG.max_features * 2]
 
         all_candidates: list[FeatureCandidate] = []
+        all_specs: list[LlmFeatureSpec] = []
         seen_signatures: set[tuple[str, tuple[str, ...]]] = set()
         for attempt in range(1, DEFAULT_CONFIG.llm_plan_max_attempts + 1):
             try:
                 response = self.client.invoke(prompt)
             except Exception as error:
                 logger.warning("LLM attempt %s failed: %s", attempt, error)
+                error_text = str(error).lower()
+                if "does not support endpoint" in error_text or "invalid_request_body" in error_text:
+                    logger.warning("Stopping LLM retries due provider endpoint incompatibility.")
+                    break
                 continue
             response_text = self._response_to_text(response)
             specs = self._parse_specs(
@@ -1008,20 +1157,116 @@ class LlmCandidatePlanner:
                 if signature in seen_signatures:
                     continue
                 seen_signatures.add(signature)
-                candidate = self._apply_spec(
-                    spec=spec,
-                    train_context=train_context,
-                    test_context=test_context,
-                    target=target,
-                    used_names=used_names,
-                )
-                if candidate is not None:
-                    candidate.metadata["llm_provider"] = self.provider
-                    candidate.metadata["plan_source"] = "llm"
-                    all_candidates.append(candidate)
+                all_specs.append(spec)
+
+        if all_specs:
+            self._write_cached_specs(cache_key=cache_key, specs=all_specs)
+
+        all_candidates.extend(
+            self._build_candidates_from_specs(
+                specs=all_specs,
+                train_context=train_context,
+                test_context=test_context,
+                target=target,
+                used_names=used_names,
+            )
+        )
 
         ranked = sorted(all_candidates, key=lambda item: (-float(item.proxy_score), float(item.compute_cost), item.name))
         return ranked[: DEFAULT_CONFIG.max_features * 2]
+
+    @staticmethod
+    def _cache_key(provider: str, prompt: str) -> str:
+        payload = f"{provider}\n{prompt}".encode("utf-8", errors="ignore")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _cache_file(self, cache_key: str) -> Path:
+        return self.cache_dir / f"{cache_key}.json"
+
+    def _read_cached_specs(
+        self,
+        *,
+        cache_key: str,
+        known_columns: set[str],
+        numeric_columns: set[str],
+        categorical_columns: set[str],
+    ) -> list[LlmFeatureSpec]:
+        if not self.disk_cache_enabled:
+            return []
+        path = self._cache_file(cache_key)
+        if not path.exists():
+            return []
+        try:
+            payload = safe_json_load(path.read_text(encoding="utf-8"))
+        except Exception as error:
+            logger.debug("Failed to read LLM cache '%s': %s", path, error)
+            return []
+        if not isinstance(payload, dict):
+            return []
+        features = payload.get("features")
+        if not isinstance(features, list):
+            return []
+        serialized = json.dumps({"features": features}, ensure_ascii=False)
+        return self._parse_specs(
+            response_text=serialized,
+            known_columns=known_columns,
+            numeric_columns=numeric_columns,
+            categorical_columns=categorical_columns,
+        )
+
+    def _write_cached_specs(self, *, cache_key: str, specs: list[LlmFeatureSpec]) -> None:
+        if not self.disk_cache_enabled or not specs:
+            return
+        deduped: list[LlmFeatureSpec] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        for spec in specs:
+            key = (spec.operation, spec.columns)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(spec)
+        payload = {
+            "provider": self.provider,
+            "cached_at_unix": int(time.time()),
+            "features": [
+                {
+                    "name": spec.name,
+                    "operation": spec.operation,
+                    "columns": list(spec.columns),
+                }
+                for spec in deduped
+            ],
+        }
+        path = self._cache_file(cache_key)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except Exception as error:
+            logger.debug("Failed to write LLM cache '%s': %s", path, error)
+
+    def _build_candidates_from_specs(
+        self,
+        *,
+        specs: list[LlmFeatureSpec],
+        train_context: pd.DataFrame,
+        test_context: pd.DataFrame,
+        target: pd.Series,
+        used_names: set[str],
+    ) -> list[FeatureCandidate]:
+        candidates: list[FeatureCandidate] = []
+        for spec in specs:
+            candidate = self._apply_spec(
+                spec=spec,
+                train_context=train_context,
+                test_context=test_context,
+                target=target,
+                used_names=used_names,
+            )
+            if candidate is not None:
+                candidate.metadata["llm_provider"] = self.provider
+                candidate.metadata["plan_source"] = "llm"
+                candidates.append(candidate)
+        return candidates
 
     def _build_prompt(
         self,
