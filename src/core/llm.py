@@ -23,6 +23,11 @@ def _llm_disabled() -> bool:
     return _env("FEATURES_AGENT_DISABLE_LLM").lower() in {"1", "true", "yes"}
 
 
+def _gigachat_model_name() -> str:
+    model = _env("GIGACHAT_MODEL")
+    return model or DEFAULT_CONFIG.model_name
+
+
 def _can_use_gigachat() -> bool:
     if not _has_non_empty_env_value("GIGACHAT_CREDENTIALS"):
         return False
@@ -106,6 +111,7 @@ def validate_llm_configuration() -> None:
 def get_gigachat_client(timeout: int = 25) -> Any | None:
     credentials = _env("GIGACHAT_CREDENTIALS")
     scope = _env("GIGACHAT_SCOPE")
+    model_name = _gigachat_model_name()
     if not credentials or not scope:
         return None
 
@@ -116,13 +122,15 @@ def get_gigachat_client(timeout: int = 25) -> Any | None:
         return None
 
     try:
+        logger.info("Initializing GigaChat client with model='%s'", model_name)
         return GigaChat(
             credentials=credentials,
             scope=scope,
-            model=DEFAULT_CONFIG.model_name,
+            model=model_name,
             temperature=0.0,
             timeout=timeout,
             verify_ssl_certs=False,
+            profanity_check=False,
         )
     except Exception as error:
         logger.warning("Failed to initialize GigaChat client: %s", error)
