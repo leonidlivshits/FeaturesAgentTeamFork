@@ -11,6 +11,7 @@ from src.features.generators.deposit_domain import DepositDomainGenerator
 from src.features.generators.heuristic_numeric import NumericHeuristicGenerator
 from src.features.generators.llm_guided import LlmGuidedGenerator
 from src.features.generators.missingness import MissingnessGenerator
+from src.features.generators.repeat_purchase_domain import RepeatPurchaseDomainGenerator
 from src.features.generators.relational_aggregates import RelationalAggregatesGenerator
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ def build_generators() -> list[FeatureGenerator]:
     heuristic_generators: list[FeatureGenerator] = [
         NumericHeuristicGenerator(),
         DepositDomainGenerator(),
+        RepeatPurchaseDomainGenerator(),
         RelationalAggregatesGenerator(),
         CategoricalFrequencyGenerator(),
         MissingnessGenerator(),

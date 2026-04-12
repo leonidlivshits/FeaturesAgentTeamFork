@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -17,6 +18,7 @@ from src.data.loaders import DataBundle
 from src.features.contracts import FeatureSet
 
 logger = logging.getLogger(__name__)
+_LLM_PLAN_CACHE: dict[str, list[list["FeatureSpec"]]] = {}
 
 
 ALLOWED_OPERATIONS = {
@@ -66,6 +68,13 @@ class LlmGuidedGenerator:
         self.disable_llm = os.getenv("FEATURES_AGENT_DISABLE_LLM", "0").strip() in {"1", "true", "yes"}
         self.llm_provider = "none" if self.disable_llm else get_effective_llm_provider()
         self.client = None if self.disable_llm else get_llm_client()
+        budget_override = os.getenv("FEATURES_AGENT_LLM_CHAR_BUDGET", "").strip()
+        try:
+            self.char_budget = int(budget_override) if budget_override else DEFAULT_CONFIG.llm_char_budget_per_run
+        except Exception:
+            self.char_budget = DEFAULT_CONFIG.llm_char_budget_per_run
+        self.char_budget = max(0, int(self.char_budget))
+        self.used_chars = 0
 
     def generate(self, bundle: DataBundle, max_features: int) -> list[FeatureSet]:
         train_context, test_context = self._build_feature_context(bundle)
@@ -90,8 +99,11 @@ class LlmGuidedGenerator:
         if not numeric_columns and not categorical_columns:
             return []
 
-        plan, plan_source = self._build_plan(
+        plan, plan_source, plan_metadata = self._build_plan(
             bundle=bundle,
+            train_df=train_context,
+            test_df=test_context,
+            target=bundle.train[bundle.target_column],
             numeric_columns=numeric_columns,
             categorical_columns=categorical_columns,
             max_features=max_features,
@@ -134,6 +146,9 @@ class LlmGuidedGenerator:
                     "selected_operations": selected_operations,
                     "selected_feature_scores": {column: selection_scores.get(column, 0.0) for column in selected_columns},
                     "candidate_plan_size": len(plan),
+                    "llm_char_budget_total": int(self.char_budget),
+                    "llm_char_budget_used": int(self.used_chars),
+                    **plan_metadata,
                 },
             )
         ]
@@ -141,38 +156,74 @@ class LlmGuidedGenerator:
     def _build_plan(
         self,
         bundle: DataBundle,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target: pd.Series,
         numeric_columns: list[str],
         categorical_columns: list[str],
         max_features: int,
-    ) -> tuple[list[FeatureSpec], str]:
-        llm_plan = self._request_llm_plan(
+    ) -> tuple[list[FeatureSpec], str, dict[str, object]]:
+        llm_candidates, cache_hit = self._request_llm_candidate_plans(
             bundle=bundle,
             numeric_columns=numeric_columns,
             categorical_columns=categorical_columns,
             max_features=max_features,
         )
-        if llm_plan:
-            return self._normalize_plan(llm_plan, max_features=max_features), "llm"
+        if llm_candidates:
+            best_plan, proxy_score = self._select_best_plan_by_proxy(
+                train_df=train_df,
+                test_df=test_df,
+                target=target,
+                candidate_plans=llm_candidates,
+                max_features=max_features,
+            )
+            if best_plan:
+                return (
+                    self._normalize_plan(best_plan, max_features=max_features),
+                    "llm",
+                    {
+                        "llm_candidate_plans": len(llm_candidates),
+                        "llm_cache_hit": cache_hit,
+                        "llm_selected_plan_proxy_score": round(float(proxy_score), 6),
+                    },
+                )
+
         fallback = self._fallback_plan(
             numeric_columns=numeric_columns,
             categorical_columns=categorical_columns,
             max_features=max_features,
         )
-        return self._normalize_plan(fallback, max_features=max_features), "fallback"
+        return (
+            self._normalize_plan(fallback, max_features=max_features),
+            "fallback",
+            {"llm_candidate_plans": 0, "llm_cache_hit": cache_hit},
+        )
 
-    def _request_llm_plan(
+    def _request_llm_candidate_plans(
         self,
         bundle: DataBundle,
         numeric_columns: list[str],
         categorical_columns: list[str],
         max_features: int,
-    ) -> list[FeatureSpec]:
+    ) -> tuple[list[list[FeatureSpec]], bool]:
         if self.disable_llm:
             logger.info("LLM usage disabled by FEATURES_AGENT_DISABLE_LLM, using fallback plan.")
-            return []
+            return [], False
         if self.client is None:
             logger.info("LLM client is unavailable for provider '%s', using fallback plan.", self.llm_provider)
-            return []
+            return [], False
+
+        schema_key = self._build_schema_cache_key(
+            bundle=bundle,
+            llm_provider=self.llm_provider,
+            numeric_columns=numeric_columns,
+            categorical_columns=categorical_columns,
+            max_features=max_features,
+        )
+        if schema_key in _LLM_PLAN_CACHE:
+            cached = _LLM_PLAN_CACHE[schema_key]
+            logger.info("LLM plan cache hit: schema_key=%s cached_candidates=%s", schema_key[:12], len(cached))
+            return cached, True
 
         prompt = self._build_prompt(
             data_readme=bundle.data_readme,
@@ -183,10 +234,26 @@ class LlmGuidedGenerator:
         )
 
         attempts = max(1, DEFAULT_CONFIG.llm_plan_max_attempts)
+        max_candidates = max(1, DEFAULT_CONFIG.llm_self_consistency_plans)
+        candidate_plans: list[list[FeatureSpec]] = []
+        seen_signatures: set[tuple[tuple[str, tuple[str, ...]], ...]] = set()
+
         for attempt in range(1, attempts + 1):
+            if len(candidate_plans) >= max_candidates:
+                break
+            if not self._has_budget_for_attempt(prompt):
+                logger.warning(
+                    "LLM char budget exhausted before attempt %s/%s: used=%s budget=%s",
+                    attempt,
+                    attempts,
+                    self.used_chars,
+                    self.char_budget,
+                )
+                break
             try:
                 response = self.client.invoke(prompt)
                 response_text = self._response_to_text(response)
+                self._consume_budget(len(prompt) + len(response_text))
                 parsed = self._parse_plan(
                     response_text=response_text,
                     known_columns=set(numeric_columns + categorical_columns),
@@ -194,8 +261,20 @@ class LlmGuidedGenerator:
                     categorical_columns=set(categorical_columns),
                 )
                 if parsed:
-                    logger.info("LLM plan received: attempt=%s specs=%s", attempt, len(parsed))
-                    return parsed
+                    normalized = self._normalize_plan(parsed, max_features=max_features)
+                    signature = self._plan_signature(normalized)
+                    if signature not in seen_signatures:
+                        candidate_plans.append(normalized)
+                        seen_signatures.add(signature)
+                        logger.info(
+                            "LLM plan received: attempt=%s specs=%s unique_candidates=%s",
+                            attempt,
+                            len(normalized),
+                            len(candidate_plans),
+                        )
+                    else:
+                        logger.info("LLM plan duplicate ignored: attempt=%s", attempt)
+                    continue
                 logger.warning("LLM returned empty/invalid plan on attempt %s/%s", attempt, attempts)
             except Exception as error:
                 logger.warning("LLM plan generation attempt %s/%s failed: %s", attempt, attempts, error)
@@ -203,8 +282,130 @@ class LlmGuidedGenerator:
             if attempt < attempts:
                 time.sleep(min(0.25 * attempt, 0.8))
 
+        if candidate_plans:
+            _LLM_PLAN_CACHE[schema_key] = candidate_plans
+            return candidate_plans, False
+
         logger.warning("LLM plan generation failed after %s attempts, fallback will be used.", attempts)
-        return []
+        return [], False
+
+    @staticmethod
+    def _plan_signature(specs: list[FeatureSpec]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        ordered = sorted(
+            ((spec.operation, tuple(spec.columns)) for spec in specs),
+            key=lambda item: (item[0], item[1]),
+        )
+        return tuple(ordered)
+
+    def _has_budget_for_attempt(self, prompt: str) -> bool:
+        if self.char_budget <= 0:
+            return True
+        remaining = self.char_budget - self.used_chars
+        min_needed = max(len(prompt) // 2, DEFAULT_CONFIG.llm_min_chars_per_attempt)
+        return remaining >= min_needed
+
+    def _consume_budget(self, consumed: int) -> None:
+        if consumed <= 0:
+            return
+        self.used_chars += int(consumed)
+
+    @staticmethod
+    def _build_schema_cache_key(
+        *,
+        bundle: DataBundle,
+        llm_provider: str,
+        numeric_columns: list[str],
+        categorical_columns: list[str],
+        max_features: int,
+    ) -> str:
+        fingerprint_payload = [
+            llm_provider,
+            bundle.schema_context.dataset_profile.dataset_type,
+            bundle.id_column,
+            bundle.target_column,
+            str(max_features),
+            "|".join(sorted(bundle.schema_context.recommended_joins.keys())),
+            "|".join(sorted(f"{k}:{v}" for k, v in bundle.schema_context.recommended_joins.items())),
+            "|".join(numeric_columns[:40]),
+            "|".join(categorical_columns[:40]),
+        ]
+        raw = "||".join(fingerprint_payload)
+        return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _select_best_plan_by_proxy(
+        self,
+        *,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target: pd.Series,
+        candidate_plans: list[list[FeatureSpec]],
+        max_features: int,
+    ) -> tuple[list[FeatureSpec], float]:
+        scored: list[tuple[list[FeatureSpec], float]] = []
+        for index, specs in enumerate(candidate_plans, start=1):
+            score = self._score_plan_proxy(
+                train_df=train_df,
+                test_df=test_df,
+                target=target,
+                specs=specs,
+                max_features=max_features,
+            )
+            scored.append((specs, score))
+            logger.info("LLM plan proxy score: candidate=%s score=%.6f", index, score)
+
+        if not scored:
+            return [], 0.0
+
+        best_specs, best_score = max(scored, key=lambda item: item[1])
+        return best_specs, float(best_score)
+
+    def _score_plan_proxy(
+        self,
+        *,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target: pd.Series,
+        specs: list[FeatureSpec],
+        max_features: int,
+    ) -> float:
+        train_features, test_features, _ = self._apply_plan(
+            train_df=train_df,
+            test_df=test_df,
+            specs=specs,
+        )
+        if train_features.empty or test_features.empty:
+            return -1.0
+
+        selected_columns, selection_scores = self._select_top_columns(
+            features=train_features,
+            target=target,
+            top_k=max_features,
+        )
+        if not selected_columns:
+            return -1.0
+
+        score_values = [selection_scores.get(column, 0.0) for column in selected_columns]
+        base_score = float(np.mean(score_values)) if score_values else 0.0
+        diversity_penalty = self._diversity_penalty(train_features[selected_columns])
+        return base_score - diversity_penalty
+
+    @staticmethod
+    def _diversity_penalty(features: pd.DataFrame) -> float:
+        if features.shape[1] <= 1:
+            return 0.0
+        numeric = features.select_dtypes(include=["number"])
+        if numeric.shape[1] <= 1:
+            return 0.0
+        corr = numeric.corr().abs()
+        if corr.empty:
+            return 0.0
+        tri = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        values = tri.to_numpy().astype("float64").ravel()
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return 0.0
+        max_corr = float(np.max(finite))
+        return max(0.0, max_corr - 0.85) * 0.05
 
     @staticmethod
     def _build_prompt(

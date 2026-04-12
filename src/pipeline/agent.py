@@ -70,7 +70,10 @@ def run_pipeline() -> PipelineResult:
     ensure_output_contract(OUTPUT_DIR)
 
     score_lookup = {score.feature_set_name: score for score in scores}
-    best_score = score_lookup.get(selected_feature_set.name, max(scores, key=lambda score: score.score))
+    best_score = score_lookup.get(
+        selected_feature_set.name,
+        max(scores, key=lambda score: (score.effective_score, score.score, -score.n_features)),
+    )
     selected_metadata = selected_feature_set.metadata if isinstance(selected_feature_set.metadata, dict) else {}
     llm_candidate_sets = [
         feature_set
@@ -95,20 +98,26 @@ def run_pipeline() -> PipelineResult:
         "candidate_sets_evaluated": len(scores),
         "selected_feature_set": selected_feature_set.name,
         "selected_cv_auc": round(float(best_score.score), 6),
+        "selected_cv_std": round(float(best_score.cv_std), 6),
+        "selected_effective_score": round(float(best_score.effective_score), 6),
         "selected_n_features": int(selected_feature_set.train_features.shape[1]),
+        "selection_strategy": selected_metadata.get("selection_strategy", "candidate_best"),
+        "group_cv_used": bool(resolve_group_series(bundle) is not None),
         "selected_plan_source": selected_metadata.get("plan_source", "n/a"),
         "selected_llm_provider": selected_metadata.get("llm_provider", "n/a"),
         "llm_candidate_sets": len(llm_candidate_sets),
         "llm_was_used": bool(llm_candidate_sets),
         "llm_providers_seen": llm_providers_seen or ["n/a"],
     }
-    ranked_scores = sorted(scores, key=lambda score: score.score, reverse=True)
+    ranked_scores = sorted(scores, key=lambda score: (score.effective_score, score.score), reverse=True)
     for rank, score in enumerate(ranked_scores, start=1):
         logger.info(
-            "Candidate rank #%s: name=%s auc=%.6f features=%s elapsed=%.2fs",
+            "Candidate rank #%s: name=%s auc=%.6f cv_std=%.6f effective=%.6f features=%s elapsed=%.2fs",
             rank,
             score.feature_set_name,
             score.score,
+            score.cv_std,
+            score.effective_score,
             score.n_features,
             score.elapsed_sec,
         )
@@ -232,16 +241,238 @@ def select_best_feature_set(
         random_seed=DEFAULT_CONFIG.random_seed,
     )
     target = bundle.train[bundle.target_column]
+    groups = resolve_group_series(bundle)
     try:
-        return evaluator.select_best(
+        best_feature_set, scores = evaluator.select_best(
             feature_sets=feature_sets,
             target=target,
+            groups=groups,
             runtime_budget=runtime_budget,
             min_seconds_per_candidate_eval=DEFAULT_CONFIG.min_seconds_per_candidate_eval,
         )
+        search_set, search_score = greedy_forward_select_feature_set(
+            feature_sets=feature_sets,
+            bundle=bundle,
+            evaluator=evaluator,
+            target=target,
+            groups=groups,
+            runtime_budget=runtime_budget,
+            max_features=DEFAULT_CONFIG.max_features,
+        )
+        if search_set is not None and search_score is not None:
+            scores.append(search_score)
+            best_existing_effective = max(
+                (
+                    score.effective_score
+                    for score in scores
+                    if score.feature_set_name != search_set.name
+                ),
+                default=-1e9,
+            )
+            if search_score.effective_score > best_existing_effective:
+                best_feature_set = search_set
+        return best_feature_set, scores
     except Exception as error:
         logger.warning("Evaluator failed, using proxy fallback selector: %s", error)
         return select_best_feature_set_fallback(feature_sets=feature_sets, target=target)
+
+
+def resolve_group_series(bundle: DataBundle) -> pd.Series | None:
+    if bundle.schema_context.dataset_profile.dataset_type != "repeat_purchase":
+        return None
+
+    candidate_columns: list[str] = []
+    detected_user = bundle.schema_context.dataset_profile.detected_entities.get("user")
+    if detected_user:
+        candidate_columns.append(detected_user)
+    candidate_columns.extend(["user_id", "client_id", "customer_id"])
+    for column in candidate_columns:
+        if column in bundle.train.columns:
+            return bundle.train[column]
+    return None
+
+
+def greedy_forward_select_feature_set(
+    *,
+    feature_sets: list[FeatureSet],
+    bundle: DataBundle,
+    evaluator: CatBoostFeatureEvaluator,
+    target: pd.Series,
+    groups: pd.Series | None,
+    runtime_budget: RuntimeBudget,
+    max_features: int,
+) -> tuple[FeatureSet | None, FeatureSetScore | None]:
+    if not feature_sets:
+        return None, None
+    if not runtime_budget.has_time(DEFAULT_CONFIG.min_seconds_per_candidate_eval):
+        return None, None
+
+    pool_train, pool_test, column_sources = build_feature_pool(feature_sets)
+    if pool_train.empty or pool_test.empty:
+        return None, None
+
+    ranked_columns = rank_pool_columns(pool_train, target)
+    candidate_columns = []
+    for column in ranked_columns:
+        if is_redundant_with_selected(pool_train, column, candidate_columns):
+            continue
+        candidate_columns.append(column)
+        if len(candidate_columns) >= 24:
+            break
+    if not candidate_columns:
+        return None, None
+
+    selected: list[str] = []
+    best_score = 0.5
+    started = time.perf_counter()
+    best_std = 0.0
+
+    for step in range(max_features):
+        if not runtime_budget.has_time(DEFAULT_CONFIG.min_seconds_per_candidate_eval):
+            break
+
+        best_candidate: str | None = None
+        best_candidate_score = best_score
+        best_candidate_std = best_std
+        for candidate in candidate_columns:
+            if candidate in selected:
+                continue
+            candidate_frame = pool_train[selected + [candidate]]
+            try:
+                mean_auc, auc_std, _ = evaluator.evaluate_features_with_stats(
+                    candidate_frame,
+                    target=target,
+                    groups=groups,
+                )
+                score = float(mean_auc - evaluator.cv_std_penalty * auc_std)
+            except Exception:
+                score = 0.5
+                auc_std = 0.0
+            if score > best_candidate_score + 1e-4:
+                best_candidate = candidate
+                best_candidate_score = score
+                best_candidate_std = float(auc_std)
+
+        if best_candidate is None:
+            break
+
+        selected.append(best_candidate)
+        best_score = best_candidate_score
+        best_std = best_candidate_std
+        logger.info(
+            "Forward selection step %s: picked=%s score=%.6f",
+            step + 1,
+            best_candidate,
+            best_score,
+        )
+
+    if not selected:
+        return None, None
+
+    metadata = {
+        "selection_strategy": "greedy_forward",
+        "selected_sources": {column: column_sources.get(column, "unknown") for column in selected},
+        "dataset_type": bundle.schema_context.dataset_profile.dataset_type,
+        "group_cv_used": bool(groups is not None),
+    }
+    feature_set = FeatureSet(
+        name="greedy_forward_search",
+        train_features=pool_train[selected].copy(),
+        test_features=pool_test[selected].copy(),
+        description="Greedy forward-selected features from candidate pool.",
+        metadata=metadata,
+    )
+    elapsed = time.perf_counter() - started
+    score = FeatureSetScore(
+        feature_set_name=feature_set.name,
+        score=float(best_score),
+        n_features=len(selected),
+        elapsed_sec=elapsed,
+        cv_std=float(best_std),
+        effective_score=float(best_score),
+        n_splits=0,
+    )
+    return feature_set, score
+
+
+def build_feature_pool(feature_sets: list[FeatureSet]) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
+    pool_train = pd.DataFrame(index=feature_sets[0].train_features.index)
+    pool_test = pd.DataFrame(index=feature_sets[0].test_features.index)
+    source_map: dict[str, str] = {}
+
+    seen_hashes: set[tuple[int, int]] = set()
+    for feature_set in feature_sets:
+        for column in feature_set.train_features.columns:
+            train_series = feature_set.train_features[column].reset_index(drop=True)
+            test_series = feature_set.test_features[column].reset_index(drop=True)
+
+            train_hash = int(pd.util.hash_pandas_object(train_series.fillna("__nan__").astype(str), index=False).sum())
+            test_hash = int(pd.util.hash_pandas_object(test_series.fillna("__nan__").astype(str), index=False).sum())
+            signature = (train_hash, test_hash)
+            if signature in seen_hashes:
+                continue
+            seen_hashes.add(signature)
+
+            safe_name = column
+            if safe_name in pool_train.columns:
+                safe_name = f"{feature_set.name}__{column}"
+            pool_train[safe_name] = train_series
+            pool_test[safe_name] = test_series
+            source_map[safe_name] = feature_set.name
+
+    return pool_train, pool_test, source_map
+
+
+def rank_pool_columns(features: pd.DataFrame, target: pd.Series) -> list[str]:
+    scored: list[tuple[str, float]] = []
+    for column in features.columns:
+        score = single_feature_proxy_score(features[column], target)
+        if np.isfinite(score):
+            scored.append((column, score))
+    ranked = sorted(scored, key=lambda item: (item[1], item[0]), reverse=True)
+    return [column for column, _ in ranked]
+
+
+def is_redundant_with_selected(
+    features: pd.DataFrame,
+    candidate: str,
+    selected: list[str],
+    threshold: float = 0.985,
+) -> bool:
+    candidate_series = features[candidate]
+    for column in selected:
+        baseline = features[column]
+        if pd.api.types.is_numeric_dtype(candidate_series) and pd.api.types.is_numeric_dtype(baseline):
+            x = pd.to_numeric(candidate_series, errors="coerce").fillna(-999.0)
+            y = pd.to_numeric(baseline, errors="coerce").fillna(-999.0)
+            if x.nunique(dropna=True) < 2 or y.nunique(dropna=True) < 2:
+                continue
+            corr = float(x.corr(y))
+            if np.isfinite(corr) and abs(corr) >= threshold:
+                return True
+        else:
+            x = candidate_series.fillna("__nan__").astype(str)
+            y = baseline.fillna("__nan__").astype(str)
+            if bool((x == y).all()):
+                return True
+    return False
+
+
+def single_feature_proxy_score(feature: pd.Series, target: pd.Series) -> float:
+    series = feature.reset_index(drop=True)
+    y = target.reset_index(drop=True)
+    if series.nunique(dropna=True) < 2 or y.nunique(dropna=True) < 2:
+        return 0.0
+
+    if pd.api.types.is_numeric_dtype(series):
+        x = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(-999.0)
+    else:
+        x = pd.Series(pd.factorize(series.fillna("__nan__").astype(str))[0], index=series.index)
+    try:
+        auc = roc_auc_score(y, x)
+        return abs(float(auc) - 0.5)
+    except Exception:
+        return 0.0
 
 
 def normalize_feature_set(feature_set: FeatureSet, max_features: int) -> FeatureSet:
@@ -384,6 +615,9 @@ def select_best_feature_set_fallback(
                 score=proxy_score,
                 n_features=feature_set.train_features.shape[1],
                 elapsed_sec=0.0,
+                cv_std=0.0,
+                effective_score=proxy_score,
+                n_splits=0,
             )
         )
 
