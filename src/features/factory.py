@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import time
 from typing import Any
 
@@ -71,6 +72,37 @@ LLM_OPERATION_RULES = {
     "is_missing": LlmOperationRule(1, 1, "any"),
 }
 
+LLM_OPERATION_ALIASES = {
+    "mean": "row_mean",
+    "avg": "row_mean",
+    "average": "row_mean",
+    "std": "row_std",
+    "stdev": "row_std",
+    "standard_deviation": "row_std",
+    "division": "ratio",
+    "divide": "ratio",
+    "quotient": "ratio",
+    "minus": "difference",
+    "subtract": "difference",
+    "subtraction": "difference",
+    "diff": "difference",
+    "delta": "difference",
+    "log": "log1p_abs",
+    "log1p": "log1p_abs",
+    "signed_log1p": "log1p_abs",
+    "missing_rate": "missing_ratio",
+    "missing_share": "missing_ratio",
+    "null_ratio": "missing_ratio",
+    "null_rate": "missing_ratio",
+    "frequency": "cat_freq",
+    "freq": "cat_freq",
+    "length": "text_len",
+    "strlen": "text_len",
+    "isnull": "is_missing",
+    "null_flag": "is_missing",
+    "missing_flag": "is_missing",
+}
+
 
 class SchemaAwareFeatureFactory:
     def __init__(self) -> None:
@@ -85,6 +117,7 @@ class SchemaAwareFeatureFactory:
         started_at = time.perf_counter()
         target = bundle.train[bundle.target_column]
         train_base, test_base = self._build_base_context(bundle=bundle, profile=profile)
+        llm_source_train, llm_source_test = train_base, test_base
         used_names: set[str] = set()
 
         candidates: list[FeatureCandidate] = []
@@ -98,13 +131,21 @@ class SchemaAwareFeatureFactory:
         )
 
         if profile.dataset_type == "deposit_like":
+            deposit_train, deposit_test = self._build_deposit_context(
+                bundle=bundle,
+                train_df=train_base,
+                test_df=test_base,
+            )
+            llm_source_train, llm_source_test = deposit_train, deposit_test
             candidates.extend(
                 self._generate_deposit_candidates(
-                    train_df=train_base,
-                    test_df=test_base,
+                    bundle=bundle,
+                    train_df=deposit_train,
+                    test_df=deposit_test,
                     profile=profile,
                     target=target,
                     used_names=used_names,
+                    context_ready=True,
                 )
             )
         elif profile.dataset_type == "repeat_purchase_like":
@@ -130,9 +171,15 @@ class SchemaAwareFeatureFactory:
 
         if self.mode != "heuristic" and runtime_budget.has_time(60):
             llm_train_context, llm_test_context = self._build_llm_context(
-                train_df=train_base,
-                test_df=test_base,
+                train_df=llm_source_train,
+                test_df=llm_source_test,
                 join_candidates=candidates,
+            )
+            logger.info(
+                "LLM context prepared: train_cols=%s test_cols=%s dataset_type=%s",
+                llm_train_context.shape[1],
+                llm_test_context.shape[1],
+                profile.dataset_type,
             )
             candidates.extend(
                 self._generate_llm_candidates(
@@ -300,19 +347,47 @@ class SchemaAwareFeatureFactory:
 
     def _generate_deposit_candidates(
         self,
+        bundle: DataBundle,
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
         profile: DatasetProfile,
         target: pd.Series,
         used_names: set[str],
+        context_ready: bool = False,
     ) -> list[FeatureCandidate]:
+        if not context_ready:
+            train_df, test_df = self._build_deposit_context(
+                bundle=bundle,
+                train_df=train_df,
+                test_df=test_df,
+            )
         candidates: list[FeatureCandidate] = []
         group_column = profile.group_column if profile.group_column in train_df.columns else None
         numeric_cols = [column for column in train_df.columns if pd.api.types.is_numeric_dtype(train_df[column])]
         financial_cols = [
             column
             for column in numeric_cols
-            if any(token in column.lower() for token in ("amount", "balance", "income", "salary", "credit", "loan", "deposit", "payment"))
+            if any(
+                token in column.lower()
+                for token in (
+                    "amount",
+                    "balance",
+                    "income",
+                    "salary",
+                    "credit",
+                    "loan",
+                    "deposit",
+                    "payment",
+                    "campaign",
+                    "pdays",
+                    "previous",
+                    "euribor",
+                    "employed",
+                    "price",
+                    "conf",
+                    "age",
+                )
+            )
         ]
         if group_column:
             candidates.extend(
@@ -352,6 +427,171 @@ class SchemaAwareFeatureFactory:
                     target=target,
                     used_names=used_names,
                     compute_cost=0.18,
+                )
+            )
+
+        candidates.extend(
+            self._generate_deposit_domain_candidates(
+                train_df=train_df,
+                test_df=test_df,
+                target=target,
+                used_names=used_names,
+            )
+        )
+        return candidates
+
+    def _build_deposit_context(
+        self,
+        *,
+        bundle: DataBundle,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        client_data = bundle.aux_tables.get("client_data")
+        if client_data is None:
+            return train_df, test_df
+
+        working = client_data.copy()
+        drop_unnamed = [
+            column
+            for column in working.columns
+            if not str(column).strip() or str(column).strip().lower().startswith("unnamed")
+        ]
+        if drop_unnamed:
+            working = working.drop(columns=drop_unnamed, errors="ignore")
+
+        join_key = bundle.id_column if bundle.id_column in working.columns else self._find_column_by_tokens(
+            working.columns,
+            ("client", "customer", "user", "account"),
+        )
+        if join_key is None or bundle.id_column not in bundle.train.columns or bundle.id_column not in bundle.test.columns:
+            return train_df, test_df
+
+        if join_key != bundle.id_column:
+            rename_map = {join_key: bundle.id_column}
+            working = working.rename(columns=rename_map)
+        join_key = bundle.id_column
+
+        if join_key not in working.columns:
+            return train_df, test_df
+
+        safe_columns = [column for column in working.columns if column != bundle.target_column]
+        working = working[safe_columns]
+
+        if working[join_key].duplicated().any():
+            numeric_cols = [
+                column
+                for column in working.columns
+                if column != join_key and pd.api.types.is_numeric_dtype(working[column])
+            ]
+            categorical_cols = [
+                column
+                for column in working.columns
+                if column != join_key and column not in numeric_cols
+            ]
+            agg_spec: dict[str, str] = {column: "mean" for column in numeric_cols}
+            for column in categorical_cols:
+                agg_spec[column] = "first"
+            working = working.groupby(join_key, dropna=False).agg(agg_spec).reset_index()
+
+        train_joined = bundle.train[[join_key]].merge(working, on=join_key, how="left").drop(columns=[join_key], errors="ignore")
+        test_joined = bundle.test[[join_key]].merge(working, on=join_key, how="left").drop(columns=[join_key], errors="ignore")
+
+        merged_train = train_df.copy()
+        merged_test = test_df.copy()
+        for column in train_joined.columns:
+            if column not in merged_train.columns and column in test_joined.columns:
+                merged_train[column] = train_joined[column]
+                merged_test[column] = test_joined[column]
+        return merged_train, merged_test
+
+    def _generate_deposit_domain_candidates(
+        self,
+        *,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target: pd.Series,
+        used_names: set[str],
+    ) -> list[FeatureCandidate]:
+        candidates: list[FeatureCandidate] = []
+        numeric_cols = [column for column in train_df.columns if pd.api.types.is_numeric_dtype(train_df[column])]
+        if not numeric_cols:
+            return candidates
+
+        definitions: list[tuple[str, pd.Series, pd.Series]] = []
+
+        if "campaign" in train_df.columns:
+            train_campaign = pd.to_numeric(train_df["campaign"], errors="coerce")
+            test_campaign = pd.to_numeric(test_df["campaign"], errors="coerce")
+            definitions.append(("campaign_log1p", np.log1p(train_campaign.clip(lower=0)), np.log1p(test_campaign.clip(lower=0))))
+
+        if "previous" in train_df.columns:
+            train_prev = pd.to_numeric(train_df["previous"], errors="coerce").fillna(0.0)
+            test_prev = pd.to_numeric(test_df["previous"], errors="coerce").fillna(0.0)
+            definitions.append(("previous_gt0", (train_prev > 0).astype("int8"), (test_prev > 0).astype("int8")))
+            if "campaign" in train_df.columns:
+                train_campaign = pd.to_numeric(train_df["campaign"], errors="coerce").fillna(0.0)
+                test_campaign = pd.to_numeric(test_df["campaign"], errors="coerce").fillna(0.0)
+                definitions.append(("campaign_to_previous_ratio", train_campaign / (1.0 + train_prev), test_campaign / (1.0 + test_prev)))
+                definitions.append(("campaign_x_previous", train_campaign * train_prev, test_campaign * test_prev))
+
+        if "pdays" in train_df.columns:
+            train_pdays = pd.to_numeric(train_df["pdays"], errors="coerce")
+            test_pdays = pd.to_numeric(test_df["pdays"], errors="coerce")
+            definitions.append(("pdays_is_999", (train_pdays == 999).astype("int8"), (test_pdays == 999).astype("int8")))
+            definitions.append(("pdays_recent_contact", ((train_pdays >= 0) & (train_pdays < 30)).astype("int8"), ((test_pdays >= 0) & (test_pdays < 30)).astype("int8")))
+
+        if "age" in train_df.columns and "campaign" in train_df.columns:
+            train_age = pd.to_numeric(train_df["age"], errors="coerce")
+            test_age = pd.to_numeric(test_df["age"], errors="coerce")
+            train_campaign = pd.to_numeric(train_df["campaign"], errors="coerce").fillna(0.0)
+            test_campaign = pd.to_numeric(test_df["campaign"], errors="coerce").fillna(0.0)
+            definitions.append(("age_to_campaign_ratio", train_age / (1.0 + train_campaign), test_age / (1.0 + test_campaign)))
+
+        if "euribor3m" in train_df.columns and "emp.var.rate" in train_df.columns:
+            train_eur = pd.to_numeric(train_df["euribor3m"], errors="coerce")
+            test_eur = pd.to_numeric(test_df["euribor3m"], errors="coerce")
+            train_emp = pd.to_numeric(train_df["emp.var.rate"], errors="coerce")
+            test_emp = pd.to_numeric(test_df["emp.var.rate"], errors="coerce")
+            definitions.append(("macro_rate_pressure", train_eur + train_emp, test_eur + test_emp))
+
+        if "cons.price.idx" in train_df.columns and "cons.conf.idx" in train_df.columns:
+            train_price = pd.to_numeric(train_df["cons.price.idx"], errors="coerce")
+            test_price = pd.to_numeric(test_df["cons.price.idx"], errors="coerce")
+            train_conf = pd.to_numeric(train_df["cons.conf.idx"], errors="coerce")
+            test_conf = pd.to_numeric(test_df["cons.conf.idx"], errors="coerce")
+            definitions.append(("consumer_spread", train_price - train_conf, test_price - test_conf))
+
+        candidates.extend(
+            self._build_candidates(
+                definitions=definitions,
+                source_family="deposit_domain",
+                target=target,
+                used_names=used_names,
+                compute_cost=0.16,
+                metadata={"join_complexity": 0.7},
+            )
+        )
+
+        top_categorical_tokens = ("job", "marital", "education", "month", "poutcome", "contact", "housing", "loan")
+        categorical_cols = [
+            column
+            for column in train_df.columns
+            if column not in numeric_cols and any(token in column.lower() for token in top_categorical_tokens)
+        ][:4]
+        for column in categorical_cols:
+            frequencies = train_df[column].fillna("__nan__").astype(str).value_counts(normalize=True, dropna=False)
+            candidates.extend(
+                self._build_candidates(
+                    [
+                        (f"{column}_freq", train_df[column].fillna("__nan__").astype(str).map(frequencies).fillna(0.0), test_df[column].fillna("__nan__").astype(str).map(frequencies).fillna(0.0)),
+                        (f"{column}_is_unknown", train_df[column].fillna("__nan__").astype(str).str.lower().eq("unknown").astype("int8"), test_df[column].fillna("__nan__").astype(str).str.lower().eq("unknown").astype("int8")),
+                    ],
+                    source_family="deposit_domain_cat",
+                    target=target,
+                    used_names=used_names,
+                    compute_cost=0.14,
+                    metadata={"join_complexity": 0.5},
                 )
             )
         return candidates
@@ -1146,12 +1386,26 @@ class LlmCandidatePlanner:
                     break
                 continue
             response_text = self._response_to_text(response)
-            specs = self._parse_specs(
+            specs, parse_stats = self._parse_specs(
                 response_text=response_text,
                 known_columns=set(common_columns),
                 numeric_columns=set(numeric_columns),
                 categorical_columns=set(categorical_columns),
             )
+            logger.info(
+                "LLM attempt %s parsed: raw_items=%s valid_specs=%s invalid_operation=%s unknown_columns=%s invalid_type=%s invalid_arity=%s empty_columns=%s missing_name=%s",
+                attempt,
+                parse_stats.get("raw_items", 0),
+                len(specs),
+                parse_stats.get("invalid_operation", 0),
+                parse_stats.get("unknown_columns", 0),
+                parse_stats.get("invalid_column_type", 0),
+                parse_stats.get("invalid_arity", 0),
+                parse_stats.get("empty_columns", 0),
+                parse_stats.get("missing_name", 0),
+            )
+            if not specs and parse_stats.get("raw_items", 0) > 0:
+                logger.info("LLM parse diagnostics: sample_item_keys=%s", parse_stats.get("sample_item_keys", "n/a"))
             for spec in specs:
                 signature = (spec.operation, spec.columns)
                 if signature in seen_signatures:
@@ -1207,12 +1461,13 @@ class LlmCandidatePlanner:
         if not isinstance(features, list):
             return []
         serialized = json.dumps({"features": features}, ensure_ascii=False)
-        return self._parse_specs(
+        specs, _ = self._parse_specs(
             response_text=serialized,
             known_columns=known_columns,
             numeric_columns=numeric_columns,
             categorical_columns=categorical_columns,
         )
+        return specs
 
     def _write_cached_specs(self, *, cache_key: str, specs: list[LlmFeatureSpec]) -> None:
         if not self.disk_cache_enabled or not specs:
@@ -1341,21 +1596,48 @@ Output schema:
         known_columns: set[str],
         numeric_columns: set[str],
         categorical_columns: set[str],
-    ) -> list[LlmFeatureSpec]:
+    ) -> tuple[list[LlmFeatureSpec], dict[str, int]]:
         parsed = safe_json_load(response_text)
-        if not isinstance(parsed, dict):
-            return []
-        items = parsed.get("features", [])
-        if not isinstance(items, list):
-            return []
+        items = self._extract_feature_items(parsed)
+        if not items:
+            return [], {"raw_items": 0}
+
+        known_lookup = {column.lower(): column for column in known_columns}
         specs: list[LlmFeatureSpec] = []
+        stats: dict[str, int] = {
+            "raw_items": len(items),
+            "missing_name": 0,
+            "invalid_operation": 0,
+            "empty_columns": 0,
+            "unknown_columns": 0,
+            "invalid_arity": 0,
+            "invalid_column_type": 0,
+        }
+        first_item_keys: list[str] | None = None
         for item in items:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name", "")).strip()
-            operation = str(item.get("operation", "")).strip()
-            columns = tuple(str(column) for column in item.get("columns", []) if str(column))
-            spec = self._validate_spec(
+            if first_item_keys is None:
+                first_item_keys = sorted(str(key) for key in item.keys())
+
+            name = self._extract_name(item)
+            operation = self._normalize_operation(item)
+            raw_columns = self._extract_columns(item)
+            columns = tuple(
+                resolved
+                for column in raw_columns
+                if (resolved := self._resolve_column_name(column, known_lookup)) is not None
+            )
+            if not columns and operation in LLM_OPERATION_RULES:
+                inferred = self._infer_columns_from_name(
+                    feature_name=name,
+                    operation=operation,
+                    known_lookup=known_lookup,
+                )
+                columns = tuple(inferred)
+            if not name and operation and columns:
+                name = self._default_name(operation=operation, columns=columns)
+            spec, reason = self._validate_spec(
                 name=name,
                 operation=operation,
                 columns=columns,
@@ -1365,7 +1647,153 @@ Output schema:
             )
             if spec is not None:
                 specs.append(spec)
-        return specs
+            elif reason in stats:
+                stats[reason] += 1
+        if first_item_keys:
+            stats["sample_item_keys"] = ",".join(first_item_keys)
+        return specs, stats
+
+    @staticmethod
+    def _extract_feature_items(parsed: Any) -> list[dict[str, Any]]:
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+        if not isinstance(parsed, dict):
+            return []
+        for key in ("features", "candidates", "feature_candidates", "proposals", "items"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        nested_data = parsed.get("data")
+        if isinstance(nested_data, dict):
+            features = nested_data.get("features")
+            if isinstance(features, list):
+                return [item for item in features if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _extract_name(item: dict[str, Any]) -> str:
+        for key in ("name", "feature_name", "title", "id"):
+            value = item.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _normalize_operation(item: dict[str, Any]) -> str:
+        raw_operation = ""
+        for key in ("operation", "op", "transform", "type", "function"):
+            value = item.get(key)
+            if value is not None and str(value).strip():
+                raw_operation = str(value).strip().lower()
+                break
+        if not raw_operation:
+            return ""
+        normalized = re.sub(r"[\s\-]+", "_", raw_operation)
+        return LLM_OPERATION_ALIASES.get(normalized, normalized)
+
+    @staticmethod
+    def _extract_columns(item: dict[str, Any]) -> list[str]:
+        candidates: list[Any] = []
+        for key in ("columns", "cols", "input_columns", "inputs", "features"):
+            if key in item:
+                candidates.append(item.get(key))
+                break
+        if not candidates:
+            if item.get("column") is not None:
+                candidates.append(item.get("column"))
+            elif item.get("column_1") is not None and item.get("column_2") is not None:
+                candidates.extend([item.get("column_1"), item.get("column_2")])
+            elif item.get("col1") is not None and item.get("col2") is not None:
+                candidates.extend([item.get("col1"), item.get("col2")])
+            elif item.get("left") is not None and item.get("right") is not None:
+                candidates.extend([item.get("left"), item.get("right")])
+            elif item.get("numerator") is not None and item.get("denominator") is not None:
+                candidates.extend([item.get("numerator"), item.get("denominator")])
+
+        flattened: list[str] = []
+        for value in candidates:
+            if isinstance(value, (list, tuple, set)):
+                flattened.extend(str(v) for v in value if v is not None and str(v).strip())
+            elif isinstance(value, dict):
+                for key in ("left", "right", "numerator", "denominator", "a", "b", "x", "y", "column", "column_1", "column_2"):
+                    token = value.get(key)
+                    if token is not None and str(token).strip():
+                        flattened.append(str(token).strip())
+                if not flattened:
+                    flattened.extend(str(v) for v in value.values() if v is not None and str(v).strip())
+            elif isinstance(value, str) and "," in value:
+                flattened.extend(part.strip() for part in value.split(",") if part.strip())
+            elif value is not None and str(value).strip():
+                flattened.append(str(value).strip())
+        return flattened
+
+    @staticmethod
+    def _resolve_column_name(raw_column: str, lookup: dict[str, str]) -> str | None:
+        token = str(raw_column).strip().strip("`\"'")
+        if not token:
+            return None
+        if token.lower() in {"none", "null", "nan"}:
+            return None
+        if token in lookup.values():
+            return token
+
+        lowered = token.lower()
+        if lowered in lookup:
+            return lookup[lowered]
+
+        normalized = lowered.replace("train.", "").replace("test.", "").replace("base.", "")
+        if normalized in lookup:
+            return lookup[normalized]
+        cleaned = re.sub(r"[^a-z0-9_.]+", "", normalized)
+        if cleaned in lookup:
+            return lookup[cleaned]
+
+        # Fallback: allow a unique substring match, useful for verbose LLM column labels.
+        contains_matches = [actual for low, actual in lookup.items() if cleaned and (cleaned in low or low in cleaned)]
+        if len(contains_matches) == 1:
+            return contains_matches[0]
+        return None
+
+    @staticmethod
+    def _default_name(operation: str, columns: tuple[str, ...]) -> str:
+        suffix = "_".join(columns[:2]) if columns else "feature"
+        return f"{operation}_{suffix}"
+
+    @staticmethod
+    def _infer_columns_from_name(
+        *,
+        feature_name: str,
+        operation: str,
+        known_lookup: dict[str, str],
+    ) -> list[str]:
+        if not feature_name:
+            return []
+        lowered_name = feature_name.lower()
+        scored: list[tuple[int, str]] = []
+        for lowered_col, actual_col in known_lookup.items():
+            compact = re.sub(r"[^a-z0-9]+", "", lowered_col)
+            if not compact:
+                continue
+            score = 0
+            if lowered_col in lowered_name:
+                score += len(compact) + 3
+            if compact and compact in re.sub(r"[^a-z0-9]+", "", lowered_name):
+                score += len(compact)
+            col_tokens = [token for token in re.split(r"[^a-z0-9]+", lowered_col) if token and len(token) > 2]
+            if col_tokens and all(token in lowered_name for token in col_tokens):
+                score += 2 + len(col_tokens)
+            if score > 0:
+                scored.append((score, actual_col))
+
+        if not scored:
+            return []
+        dedup: list[str] = []
+        for _, column in sorted(scored, key=lambda item: (-item[0], item[1])):
+            if column not in dedup:
+                dedup.append(column)
+
+        arity = LLM_OPERATION_RULES.get(operation, LlmOperationRule(1, 1, "any")).max_columns
+        return dedup[:arity]
 
     def _validate_spec(
         self,
@@ -1375,21 +1803,25 @@ Output schema:
         known_columns: set[str],
         numeric_columns: set[str],
         categorical_columns: set[str],
-    ) -> LlmFeatureSpec | None:
-        if not name or operation not in LLM_ALLOWED_OPERATIONS or not columns:
-            return None
+    ) -> tuple[LlmFeatureSpec | None, str]:
+        if not name:
+            return None, "missing_name"
+        if operation not in LLM_ALLOWED_OPERATIONS:
+            return None, "invalid_operation"
+        if not columns:
+            return None, "empty_columns"
         if any(column not in known_columns for column in columns):
-            return None
+            return None, "unknown_columns"
 
         rule = LLM_OPERATION_RULES[operation]
         dedup_columns = tuple(dict.fromkeys(columns))
         if not (rule.min_columns <= len(dedup_columns) <= rule.max_columns):
-            return None
+            return None, "invalid_arity"
         if rule.column_type == "numeric" and any(column not in numeric_columns for column in dedup_columns):
-            return None
+            return None, "invalid_column_type"
         if rule.column_type == "categorical" and any(column not in categorical_columns for column in dedup_columns):
-            return None
-        return LlmFeatureSpec(name=name, operation=operation, columns=dedup_columns)
+            return None, "invalid_column_type"
+        return LlmFeatureSpec(name=name, operation=operation, columns=dedup_columns), "ok"
 
     def _apply_spec(
         self,
