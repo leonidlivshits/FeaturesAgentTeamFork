@@ -20,7 +20,6 @@ from src.features.contracts import FeatureCandidate, normalize_feature_name
 from src.features.generators.categorical_frequency import CategoricalFrequencyGenerator
 from src.features.generators.heuristic_numeric import NumericHeuristicGenerator
 from src.features.generators.missingness import MissingnessGenerator
-from src.features.generators.relational_aggregates import RelationalAggregatesGenerator
 from src.features.registry import get_effective_generator_mode
 from src.schema.contracts import DatasetProfile, JoinEdge, JoinPlan
 
@@ -125,7 +124,7 @@ class SchemaAwareFeatureFactory:
             )
         )
 
-        if self.mode != "heuristic" and runtime_budget.has_time(25):
+        if self.mode != "heuristic" and runtime_budget.has_time(60):
             llm_train_context, llm_test_context = self._build_llm_context(
                 train_df=train_base,
                 test_df=test_base,
@@ -444,12 +443,17 @@ class SchemaAwareFeatureFactory:
     ) -> list[FeatureCandidate]:
         candidates: list[FeatureCandidate] = []
         processed_direct = 0
+        processed_two_hop = 0
         for plan in sorted(profile.join_plans, key=lambda item: (-item.total_score, item.hop_count, item.output_table)):
             output_df = bundle.aux_tables.get(plan.output_table)
             output_rows = len(output_df) if output_df is not None else 0
             if plan.hop_count == 2 and output_rows >= HUGE_TABLE_ROWS:
                 continue
+            if plan.hop_count == 2 and processed_two_hop >= 1:
+                continue
             if plan.hop_count == 1 and output_rows >= VERY_HUGE_TABLE_ROWS and processed_direct >= 1:
+                continue
+            if plan.hop_count == 1 and processed_direct >= 2:
                 continue
             if plan.hop_count == 1:
                 processed_direct += 1
@@ -463,6 +467,7 @@ class SchemaAwareFeatureFactory:
                     )
                 )
             elif plan.hop_count == 2:
+                processed_two_hop += 1
                 candidates.extend(
                     self._generate_two_hop_candidates(
                         bundle=bundle,
@@ -494,8 +499,8 @@ class SchemaAwareFeatureFactory:
             table_name=aux_table,
             profile=profile,
             key_column=aux_key,
-            limit_numeric=3,
-            limit_categorical=2,
+            limit_numeric=2,
+            limit_categorical=1,
         )
         if aggregated.empty or base_key not in bundle.train.columns or base_key not in bundle.test.columns:
             return []
@@ -548,7 +553,7 @@ class SchemaAwareFeatureFactory:
             table_name=target_table,
             profile=profile,
             key_column=target_key,
-            limit_numeric=2,
+            limit_numeric=1,
             limit_categorical=1,
         )
         if target_aggregated.empty:
@@ -577,7 +582,7 @@ class SchemaAwareFeatureFactory:
             column
             for column in merged_intermediate.columns
             if column != intermediate_base_key and pd.api.types.is_numeric_dtype(merged_intermediate[column])
-        ][:3]
+        ][:2]
         for column in numeric_columns:
             result[f"{prefix}_{column}_mean"] = grouped[column].mean()
             result[f"{prefix}_{column}_max"] = grouped[column].max()
@@ -685,7 +690,7 @@ class SchemaAwareFeatureFactory:
         ranked = sorted(join_candidates, key=lambda item: (-float(item.proxy_score), item.name))
         context_train = train_df.copy()
         context_test = test_df.copy()
-        for candidate in ranked[:8]:
+        for candidate in ranked[:5]:
             context_train[candidate.name] = candidate.train_feature.reset_index(drop=True)
             context_test[candidate.name] = candidate.test_feature.reset_index(drop=True)
         return context_train, context_test
@@ -705,7 +710,7 @@ class SchemaAwareFeatureFactory:
             return []
         top_heuristics = [
             {"name": candidate.name, "family": candidate.source_family, "proxy": round(float(candidate.proxy_score), 6)}
-            for candidate in sorted(heuristics, key=lambda item: (-float(item.proxy_score), item.name))[:8]
+            for candidate in sorted(heuristics, key=lambda item: (-float(item.proxy_score), item.name))[:5]
         ]
         return planner.generate_candidates(
             bundle=bundle,
@@ -725,7 +730,6 @@ class SchemaAwareFeatureFactory:
     ) -> list[FeatureCandidate]:
         fallback_generators = [
             NumericHeuristicGenerator(),
-            RelationalAggregatesGenerator(),
             CategoricalFrequencyGenerator(),
             MissingnessGenerator(),
         ]
@@ -759,8 +763,7 @@ class SchemaAwareFeatureFactory:
         used_names: set[str],
         family: str,
     ) -> list[FeatureCandidate]:
-        combined = pd.concat([train_df[[group_column]], test_df[[group_column]]], axis=0, ignore_index=True)
-        counts = combined[group_column].fillna("__nan__").astype(str).value_counts()
+        counts = train_df[group_column].fillna("__nan__").astype(str).value_counts()
         train_series = train_df[group_column].fillna("__nan__").astype(str).map(counts).fillna(0.0)
         test_series = test_df[group_column].fillna("__nan__").astype(str).map(counts).fillna(0.0)
         return self._build_candidates(
@@ -778,17 +781,15 @@ class SchemaAwareFeatureFactory:
         group_column: str,
         value_column: str,
     ) -> tuple[pd.Series, pd.Series]:
-        combined = pd.concat(
-            [
-                train_df[[group_column, value_column]],
-                test_df[[group_column, value_column]],
-            ],
-            axis=0,
-            ignore_index=True,
+        fit_frame = pd.DataFrame(
+            {
+                "_group_key": train_df[group_column].fillna("__nan__").astype(str),
+                "_value": pd.to_numeric(train_df[value_column], errors="coerce"),
+            }
         )
-        means = combined.groupby(group_column, dropna=False)[value_column].mean()
-        train_series = train_df[group_column].map(means)
-        test_series = test_df[group_column].map(means)
+        means = fit_frame.groupby("_group_key", dropna=False)["_value"].mean()
+        train_series = train_df[group_column].fillna("__nan__").astype(str).map(means)
+        test_series = test_df[group_column].fillna("__nan__").astype(str).map(means)
         return train_series, test_series
 
     def _pair_count_feature(
@@ -798,16 +799,8 @@ class SchemaAwareFeatureFactory:
         left_column: str,
         right_column: str,
     ) -> tuple[pd.Series, pd.Series]:
-        combined = pd.concat(
-            [
-                train_df[[left_column, right_column]],
-                test_df[[left_column, right_column]],
-            ],
-            axis=0,
-            ignore_index=True,
-        )
-        pair_key = combined[left_column].fillna("__nan__").astype(str) + "||" + combined[right_column].fillna("__nan__").astype(str)
-        counts = pair_key.value_counts()
+        train_key = train_df[left_column].fillna("__nan__").astype(str) + "||" + train_df[right_column].fillna("__nan__").astype(str)
+        counts = train_key.value_counts()
         train_key = train_df[left_column].fillna("__nan__").astype(str) + "||" + train_df[right_column].fillna("__nan__").astype(str)
         test_key = test_df[left_column].fillna("__nan__").astype(str) + "||" + test_df[right_column].fillna("__nan__").astype(str)
         return train_key.map(counts).fillna(0.0), test_key.map(counts).fillna(0.0)
@@ -821,17 +814,15 @@ class SchemaAwareFeatureFactory:
     ) -> tuple[pd.Series, pd.Series]:
         train_time = pd.to_datetime(train_df[time_column], errors="coerce")
         test_time = pd.to_datetime(test_df[time_column], errors="coerce")
-        combined = pd.concat(
-            [
-                pd.DataFrame({group_column: train_df[group_column], time_column: train_time}),
-                pd.DataFrame({group_column: test_df[group_column], time_column: test_time}),
-            ],
-            axis=0,
-            ignore_index=True,
+        fit_frame = pd.DataFrame(
+            {
+                "_group_key": train_df[group_column].fillna("__nan__").astype(str),
+                "_time": train_time,
+            }
         )
-        max_time = combined.groupby(group_column, dropna=False)[time_column].max()
-        train_series = (train_df[group_column].map(max_time) - train_time).dt.days
-        test_series = (test_df[group_column].map(max_time) - test_time).dt.days
+        max_time = fit_frame.groupby("_group_key", dropna=False)["_time"].max()
+        train_series = (train_df[group_column].fillna("__nan__").astype(str).map(max_time) - train_time).dt.days
+        test_series = (test_df[group_column].fillna("__nan__").astype(str).map(max_time) - test_time).dt.days
         return train_series, test_series
 
     def _rank_numeric_columns(
