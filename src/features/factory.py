@@ -759,8 +759,7 @@ class SchemaAwareFeatureFactory:
         used_names: set[str],
         family: str,
     ) -> list[FeatureCandidate]:
-        combined = pd.concat([train_df[[group_column]], test_df[[group_column]]], axis=0, ignore_index=True)
-        counts = combined[group_column].fillna("__nan__").astype(str).value_counts()
+        counts = train_df[group_column].fillna("__nan__").astype(str).value_counts()
         train_series = train_df[group_column].fillna("__nan__").astype(str).map(counts).fillna(0.0)
         test_series = test_df[group_column].fillna("__nan__").astype(str).map(counts).fillna(0.0)
         return self._build_candidates(
@@ -778,17 +777,15 @@ class SchemaAwareFeatureFactory:
         group_column: str,
         value_column: str,
     ) -> tuple[pd.Series, pd.Series]:
-        combined = pd.concat(
-            [
-                train_df[[group_column, value_column]],
-                test_df[[group_column, value_column]],
-            ],
-            axis=0,
-            ignore_index=True,
+        fit_frame = pd.DataFrame(
+            {
+                "_group_key": train_df[group_column].fillna("__nan__").astype(str),
+                "_value": pd.to_numeric(train_df[value_column], errors="coerce"),
+            }
         )
-        means = combined.groupby(group_column, dropna=False)[value_column].mean()
-        train_series = train_df[group_column].map(means)
-        test_series = test_df[group_column].map(means)
+        means = fit_frame.groupby("_group_key", dropna=False)["_value"].mean()
+        train_series = train_df[group_column].fillna("__nan__").astype(str).map(means)
+        test_series = test_df[group_column].fillna("__nan__").astype(str).map(means)
         return train_series, test_series
 
     def _pair_count_feature(
@@ -798,16 +795,8 @@ class SchemaAwareFeatureFactory:
         left_column: str,
         right_column: str,
     ) -> tuple[pd.Series, pd.Series]:
-        combined = pd.concat(
-            [
-                train_df[[left_column, right_column]],
-                test_df[[left_column, right_column]],
-            ],
-            axis=0,
-            ignore_index=True,
-        )
-        pair_key = combined[left_column].fillna("__nan__").astype(str) + "||" + combined[right_column].fillna("__nan__").astype(str)
-        counts = pair_key.value_counts()
+        train_key = train_df[left_column].fillna("__nan__").astype(str) + "||" + train_df[right_column].fillna("__nan__").astype(str)
+        counts = train_key.value_counts()
         train_key = train_df[left_column].fillna("__nan__").astype(str) + "||" + train_df[right_column].fillna("__nan__").astype(str)
         test_key = test_df[left_column].fillna("__nan__").astype(str) + "||" + test_df[right_column].fillna("__nan__").astype(str)
         return train_key.map(counts).fillna(0.0), test_key.map(counts).fillna(0.0)
@@ -821,17 +810,15 @@ class SchemaAwareFeatureFactory:
     ) -> tuple[pd.Series, pd.Series]:
         train_time = pd.to_datetime(train_df[time_column], errors="coerce")
         test_time = pd.to_datetime(test_df[time_column], errors="coerce")
-        combined = pd.concat(
-            [
-                pd.DataFrame({group_column: train_df[group_column], time_column: train_time}),
-                pd.DataFrame({group_column: test_df[group_column], time_column: test_time}),
-            ],
-            axis=0,
-            ignore_index=True,
+        fit_frame = pd.DataFrame(
+            {
+                "_group_key": train_df[group_column].fillna("__nan__").astype(str),
+                "_time": train_time,
+            }
         )
-        max_time = combined.groupby(group_column, dropna=False)[time_column].max()
-        train_series = (train_df[group_column].map(max_time) - train_time).dt.days
-        test_series = (test_df[group_column].map(max_time) - test_time).dt.days
+        max_time = fit_frame.groupby("_group_key", dropna=False)["_time"].max()
+        train_series = (train_df[group_column].fillna("__nan__").astype(str).map(max_time) - train_time).dt.days
+        test_series = (test_df[group_column].fillna("__nan__").astype(str).map(max_time) - test_time).dt.days
         return train_series, test_series
 
     def _rank_numeric_columns(
