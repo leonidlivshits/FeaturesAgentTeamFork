@@ -39,9 +39,12 @@ class RuntimeConfig:
     llm_self_consistency_plans: int = 3
     llm_char_budget_per_run: int = 50000
     llm_min_chars_per_attempt: int = 800
+    llm_min_seconds_remaining: int = 90
+    llm_large_dataset_row_limit: int = 250000
     default_generator_mode: str = "auto"
     default_llm_provider: str = "auto"
     cv_std_penalty: float = 0.12
+    selection_fast_mode_row_limit: int = 250000
     openrouter_model: str = "qwen/qwen-2.5-72b-instruct"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 

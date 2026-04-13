@@ -154,3 +154,10 @@ def test_forward_selection_caps_llm_features() -> None:
     )
     llm_count = sum(1 for item in result.selected_candidates if item.source_family == "llm_planner")
     assert llm_count <= 2
+
+
+def test_search_width_uses_fast_mode_for_large_datasets() -> None:
+    width_round1 = CatBoostFeatureSelector._search_width(round_idx=1, total_remaining=20, target_size=300_000)
+    width_round2 = CatBoostFeatureSelector._search_width(round_idx=2, total_remaining=20, target_size=300_000)
+    assert width_round1 <= 2
+    assert width_round2 <= 1

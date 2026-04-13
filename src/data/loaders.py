@@ -41,7 +41,7 @@ class DataBundle:
     data_readme: str
     id_column: str
     target_column: str
-    schema_context: SchemaContext
+    schema_context: SchemaContext | None = None
 
 
 def read_csv_auto(path: Path) -> pd.DataFrame:

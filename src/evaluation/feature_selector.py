@@ -131,7 +131,11 @@ class CatBoostFeatureSelector:
                 break
 
             round_best: tuple[FeatureCandidate, float, float, dict[str, Any]] | None = None
-            search_width = self._search_width(round_idx=round_idx, total_remaining=len(remaining))
+            search_width = self._search_width(
+                round_idx=round_idx,
+                total_remaining=len(remaining),
+                target_size=len(target),
+            )
             llm_selected_count = sum(1 for item in selected if item.source_family == "llm_planner")
             max_llm_features = max(0, int(DEFAULT_CONFIG.selection_max_llm_features))
             round_candidates = sorted(
@@ -370,16 +374,17 @@ class CatBoostFeatureSelector:
             {candidate.name: candidate.train_feature.reset_index(drop=True) for candidate in candidates}
         )
         X, cat_indices = self._prepare_features(X)
+        model_params = self._catboost_params_for_rows(n_rows=len(y))
+        repeat_count = self._holdout_repeats_for_rows(n_rows=len(y))
 
         fold_scores: list[float] = []
         if cv_strategy == "group_holdout" and groups is not None:
             group_series = groups.reset_index(drop=True)
-            repeat_count = max(1, int(DEFAULT_CONFIG.holdout_repeats))
             for repeat_idx in range(repeat_count):
                 split_seed = self.random_seed + repeat_idx * int(DEFAULT_CONFIG.holdout_seed_stride)
                 holdout_splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=split_seed)
                 for train_idx, valid_idx in holdout_splitter.split(X, y, group_series):
-                    model = CatBoostClassifier(**CATBOOST_SELECTION_PARAMS)
+                    model = CatBoostClassifier(**model_params)
                     model.fit(
                         X.iloc[train_idx],
                         y.iloc[train_idx],
@@ -388,12 +393,11 @@ class CatBoostFeatureSelector:
                     probabilities = model.predict_proba(X.iloc[valid_idx])[:, 1]
                     fold_scores.append(float(roc_auc_score(y.iloc[valid_idx], probabilities)))
         elif cv_strategy == "stratified_holdout":
-            repeat_count = max(1, int(DEFAULT_CONFIG.holdout_repeats))
             for repeat_idx in range(repeat_count):
                 split_seed = self.random_seed + repeat_idx * int(DEFAULT_CONFIG.holdout_seed_stride)
                 holdout_splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=split_seed)
                 for train_idx, valid_idx in holdout_splitter.split(X, y):
-                    model = CatBoostClassifier(**CATBOOST_SELECTION_PARAMS)
+                    model = CatBoostClassifier(**model_params)
                     model.fit(
                         X.iloc[train_idx],
                         y.iloc[train_idx],
@@ -407,7 +411,7 @@ class CatBoostFeatureSelector:
             else:
                 split_args = (X, y)
             for train_idx, valid_idx in splitter.split(*split_args):
-                model = CatBoostClassifier(**CATBOOST_SELECTION_PARAMS)
+                model = CatBoostClassifier(**model_params)
                 model.fit(
                     X.iloc[train_idx],
                     y.iloc[train_idx],
@@ -448,7 +452,18 @@ class CatBoostFeatureSelector:
         )
 
     @staticmethod
-    def _search_width(round_idx: int, total_remaining: int) -> int:
+    def _search_width(round_idx: int, total_remaining: int, target_size: int) -> int:
+        fast_mode_limit = max(100_000, int(DEFAULT_CONFIG.selection_fast_mode_row_limit))
+        if target_size >= fast_mode_limit:
+            if round_idx <= 1:
+                return min(total_remaining, 2)
+            return min(total_remaining, 1)
+        if target_size >= 120_000:
+            if round_idx <= 1:
+                return min(total_remaining, 2)
+            if round_idx == 2:
+                return min(total_remaining, 2)
+            return min(total_remaining, 1)
         if total_remaining >= 12:
             if round_idx <= 1:
                 return min(total_remaining, 3)
@@ -522,6 +537,30 @@ class CatBoostFeatureSelector:
         total_variation = float(0.5 * np.abs(train_aligned - test_aligned).sum())
         distribution_shift = float(min(2.0, total_variation + unseen_ratio))
         return {"distribution_shift": distribution_shift, "unseen_ratio": unseen_ratio}
+
+    @staticmethod
+    def _catboost_params_for_rows(n_rows: int) -> dict[str, Any]:
+        params = CATBOOST_SELECTION_PARAMS.copy()
+        if n_rows >= 500_000:
+            params["iterations"] = 70
+            params["depth"] = 4
+            params["learning_rate"] = 0.07
+        elif n_rows >= 250_000:
+            params["iterations"] = 90
+            params["depth"] = 5
+            params["learning_rate"] = 0.06
+        elif n_rows >= 120_000:
+            params["iterations"] = 120
+            params["depth"] = 5
+            params["learning_rate"] = 0.055
+        return params
+
+    @staticmethod
+    def _holdout_repeats_for_rows(n_rows: int) -> int:
+        repeats = max(1, int(DEFAULT_CONFIG.holdout_repeats))
+        if n_rows >= 250_000:
+            return 1
+        return repeats
 
 
 def score_single_feature_proxy(feature: pd.Series, target: pd.Series) -> float:

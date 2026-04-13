@@ -169,7 +169,18 @@ class SchemaAwareFeatureFactory:
             )
         )
 
-        if self.mode != "heuristic" and runtime_budget.has_time(60):
+        llm_min_seconds = max(60, int(DEFAULT_CONFIG.llm_min_seconds_remaining))
+        llm_large_dataset_limit = max(50_000, int(DEFAULT_CONFIG.llm_large_dataset_row_limit))
+        llm_allowed = self.mode != "heuristic" and runtime_budget.has_time(llm_min_seconds)
+        if llm_allowed and len(bundle.train) >= llm_large_dataset_limit:
+            llm_allowed = False
+            logger.info(
+                "Skipping LLM generation on large dataset: train_rows=%s limit=%s",
+                len(bundle.train),
+                llm_large_dataset_limit,
+            )
+
+        if llm_allowed:
             llm_train_context, llm_test_context = self._build_llm_context(
                 train_df=llm_source_train,
                 test_df=llm_source_test,
@@ -1391,6 +1402,7 @@ class LlmCandidatePlanner:
                 known_columns=set(common_columns),
                 numeric_columns=set(numeric_columns),
                 categorical_columns=set(categorical_columns),
+                return_stats=True,
             )
             logger.info(
                 "LLM attempt %s parsed: raw_items=%s valid_specs=%s invalid_operation=%s unknown_columns=%s invalid_type=%s invalid_arity=%s empty_columns=%s missing_name=%s",
@@ -1461,7 +1473,7 @@ class LlmCandidatePlanner:
         if not isinstance(features, list):
             return []
         serialized = json.dumps({"features": features}, ensure_ascii=False)
-        specs, _ = self._parse_specs(
+        specs = self._parse_specs(
             response_text=serialized,
             known_columns=known_columns,
             numeric_columns=numeric_columns,
@@ -1596,11 +1608,13 @@ Output schema:
         known_columns: set[str],
         numeric_columns: set[str],
         categorical_columns: set[str],
-    ) -> tuple[list[LlmFeatureSpec], dict[str, int]]:
+        return_stats: bool = False,
+    ) -> list[LlmFeatureSpec] | tuple[list[LlmFeatureSpec], dict[str, int]]:
         parsed = safe_json_load(response_text)
         items = self._extract_feature_items(parsed)
         if not items:
-            return [], {"raw_items": 0}
+            empty = {"raw_items": 0}
+            return ([], empty) if return_stats else []
 
         known_lookup = {column.lower(): column for column in known_columns}
         specs: list[LlmFeatureSpec] = []
@@ -1651,7 +1665,7 @@ Output schema:
                 stats[reason] += 1
         if first_item_keys:
             stats["sample_item_keys"] = ",".join(first_item_keys)
-        return specs, stats
+        return (specs, stats) if return_stats else specs
 
     @staticmethod
     def _extract_feature_items(parsed: Any) -> list[dict[str, Any]]:
