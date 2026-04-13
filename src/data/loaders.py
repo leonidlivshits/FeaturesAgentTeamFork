@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -36,19 +37,20 @@ class DataBundle:
 def read_csv_auto(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing required file: {path}")
-    candidates: list[pd.DataFrame] = []
-    separators = (None, ",", ";", "\t", "|")
     encodings = ("utf-8-sig", "utf-8", "cp1251")
+    delimiter_priority = _detect_delimiters(path=path)
+    candidates: list[pd.DataFrame] = []
+
     for encoding in encodings:
-        for sep in separators:
-            try:
-                if sep is None:
-                    frame = pd.read_csv(path, sep=None, engine="python", encoding=encoding)
-                else:
-                    frame = pd.read_csv(path, sep=sep, engine="python", encoding=encoding)
-            except Exception:
+        for sep in delimiter_priority:
+            frame = _read_csv_with_sep(path=path, sep=sep, encoding=encoding)
+            if frame is None:
                 continue
-            candidates.append(_sanitize_column_names(frame))
+            cleaned = _sanitize_column_names(frame)
+            candidates.append(cleaned)
+            # Fast path: plausible parse, avoid extra heavy full-file reads.
+            if cleaned.shape[1] > 1:
+                return cleaned
 
     if not candidates:
         raise ValueError(f"Unable to read CSV with auto-detection: {path}")
@@ -73,7 +75,11 @@ def load_data_bundle(data_dir: Path) -> DataBundle:
     readme_path = data_dir / "readme.txt"
     data_readme = readme_path.read_text(encoding="utf-8", errors="ignore") if readme_path.exists() else ""
 
-    id_column, target_column = infer_key_columns(train=train, test=test)
+    try:
+        id_column, target_column = infer_key_columns(train=train, test=test)
+    except Exception as error:
+        logger.warning("Key inference failed (%s). Applying fallback key inference.", error)
+        train, test, id_column, target_column = infer_key_columns_fallback(train=train, test=test)
     schema_context = build_schema_context(
         train=train,
         test=test,
@@ -173,6 +179,62 @@ def pick_id_column(train: pd.DataFrame, test: pd.DataFrame, common_columns: list
     return ranked[0]
 
 
+def infer_key_columns_fallback(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, str, str]:
+    train_fixed = train.copy()
+    test_fixed = test.copy()
+
+    # Target: prefer explicit names; otherwise choose likely label-like column from train-only fields.
+    target_candidates = [column for column in train_fixed.columns if column not in test_fixed.columns]
+    target_column = ""
+    if target_candidates:
+        target_column = pick_target_column(target_candidates)
+    else:
+        lowered_map = {str(column).lower(): str(column) for column in train_fixed.columns}
+        for preferred in PREFERRED_TARGET_NAMES:
+            if preferred in lowered_map:
+                target_column = lowered_map[preferred]
+                break
+        if not target_column:
+            binary_candidates = [
+                str(column)
+                for column in train_fixed.columns
+                if train_fixed[column].nunique(dropna=True) <= 2 and "id" not in str(column).lower()
+            ]
+            if binary_candidates:
+                target_column = binary_candidates[0]
+            else:
+                target_column = str(train_fixed.columns[-1])
+
+    # ID: try common columns first.
+    common_columns = [column for column in train_fixed.columns if column in test_fixed.columns and column != target_column]
+    if common_columns:
+        id_column = pick_id_column(train=train_fixed, test=test_fixed, common_columns=common_columns)
+        return train_fixed, test_fixed, id_column, target_column
+
+    # Positional rescue: align first column of test to first train non-target column.
+    train_non_target = [str(column) for column in train_fixed.columns if str(column) != target_column]
+    if not train_non_target or test_fixed.shape[1] == 0:
+        raise ValueError("Fallback key inference failed: cannot identify id column.")
+
+    id_column = train_non_target[0]
+    test_first = str(test_fixed.columns[0])
+    if test_first != id_column:
+        # Rename only if target id name is not already present to avoid duplicate columns.
+        if id_column not in test_fixed.columns:
+            test_fixed = test_fixed.rename(columns={test_first: id_column})
+        else:
+            # Last-resort: force a shared synthetic id on row order.
+            synthetic_id = "__row_id__"
+            train_fixed[synthetic_id] = range(len(train_fixed))
+            test_fixed[synthetic_id] = range(len(test_fixed))
+            id_column = synthetic_id
+
+    return train_fixed, test_fixed, id_column, target_column
+
+
 def _sanitize_column_names(frame: pd.DataFrame) -> pd.DataFrame:
     renamed: dict[str, str] = {}
     used: set[str] = set()
@@ -227,3 +289,37 @@ def _parse_quality_score(frame: pd.DataFrame) -> tuple[int, int, int]:
     unnamed = sum(str(column).lower().startswith("unnamed") for column in frame.columns)
     n_rows = int(frame.shape[0])
     return (n_columns, -unnamed, n_rows)
+
+
+def _detect_delimiters(path: Path) -> tuple[str, ...]:
+    default = (",", ";", "\t", "|")
+    try:
+        sample_bytes = path.read_bytes()[:65536]
+    except Exception:
+        return default
+    for encoding in ("utf-8-sig", "utf-8", "cp1251"):
+        try:
+            sample = sample_bytes.decode(encoding, errors="ignore")
+        except Exception:
+            continue
+        if not sample.strip():
+            continue
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=";,\t|")
+            detected = str(dialect.delimiter)
+            ordered = [detected] + [item for item in default if item != detected]
+            return tuple(ordered)
+        except Exception:
+            continue
+    return default
+
+
+def _read_csv_with_sep(path: Path, sep: str, encoding: str) -> pd.DataFrame | None:
+    try:
+        return pd.read_csv(path, sep=sep, engine="c", encoding=encoding)
+    except Exception:
+        pass
+    try:
+        return pd.read_csv(path, sep=sep, engine="python", encoding=encoding)
+    except Exception:
+        return None

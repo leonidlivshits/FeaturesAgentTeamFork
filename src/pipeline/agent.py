@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,7 +35,11 @@ class PipelineResult:
 
 def run_pipeline() -> PipelineResult:
     ensure_input_contract(DATA_DIR)
-    validate_llm_configuration()
+    try:
+        validate_llm_configuration()
+    except Exception as error:
+        logger.warning("LLM configuration invalid (%s). Disabling LLM and continuing.", error)
+        os.environ["FEATURES_AGENT_DISABLE_LLM"] = "1"
     prepare_output_dir(OUTPUT_DIR)
     runtime_budget = RuntimeBudget(
         total_sec=DEFAULT_CONFIG.internal_time_budget_sec,
