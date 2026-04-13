@@ -30,6 +30,10 @@ class RuntimeConfig:
     holdout_repeats: int = 2
     holdout_seed_stride: int = 37
     selection_family_repeat_penalty: float = 0.0015
+    selection_cv_std_penalty: float = 0.12
+    selection_distribution_shift_penalty: float = 0.015
+    selection_unseen_ratio_penalty: float = 0.02
+    selection_max_llm_features: int = 2
     selection_min_features: int = 3
     selection_forced_max_drop: float = 0.003
     llm_self_consistency_plans: int = 3

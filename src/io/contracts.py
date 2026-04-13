@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.data.loaders import infer_key_columns, infer_key_columns_fallback
+
 
 def validate_output_contract(
     *,
@@ -30,20 +32,33 @@ def validate_output_contract(
             f"Test row count mismatch. expected={len(input_test)}, got={len(output_test)}"
         )
 
-    for column in input_train.columns:
+    try:
+        id_column, target_column = infer_key_columns(train=input_train, test=input_test)
+    except Exception:
+        _, _, id_column, target_column = infer_key_columns_fallback(
+            train=input_train,
+            test=input_test,
+        )
+
+    required_train = [id_column, target_column]
+    required_test = [id_column]
+    for column in required_train:
         if column not in output_train.columns:
             raise ValueError(f"Missing required column in output/train.csv: {column}")
-    for column in input_test.columns:
+    for column in required_test:
         if column not in output_test.columns:
             raise ValueError(f"Missing required column in output/test.csv: {column}")
+
+    if target_column in output_test.columns:
+        raise ValueError(f"output/test.csv must not contain target column '{target_column}'.")
 
     if not output_train.columns.is_unique:
         raise ValueError("Duplicate columns in output/train.csv")
     if not output_test.columns.is_unique:
         raise ValueError("Duplicate columns in output/test.csv")
 
-    reserved_train = set(input_train.columns)
-    reserved_test = set(input_test.columns)
+    reserved_train = set(required_train)
+    reserved_test = set(required_test)
     feature_cols_train = [c for c in output_train.columns if c not in reserved_train]
     feature_cols_test = [c for c in output_test.columns if c not in reserved_test]
 
@@ -61,4 +76,3 @@ def validate_output_contract(
             raise ValueError(f"Feature {column} in output/train.csv is all NaN")
         if output_test[column].isna().all():
             raise ValueError(f"Feature {column} in output/test.csv is all NaN")
-

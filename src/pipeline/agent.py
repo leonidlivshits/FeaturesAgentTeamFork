@@ -94,6 +94,8 @@ def run_pipeline() -> PipelineResult:
         test_base=bundle.test,
         selected_feature_set=selection_result.feature_set,
         output_dir=OUTPUT_DIR,
+        id_column=bundle.id_column,
+        target_column=bundle.target_column,
     )
     validate_output_contract(
         input_train=bundle.train,
@@ -142,6 +144,10 @@ def run_pipeline() -> PipelineResult:
         "fallback_reason": selection_result.fallback_reason or "n/a",
         "selection_strategy": "forward_selection",
         "selection_family_repeat_penalty": float(DEFAULT_CONFIG.selection_family_repeat_penalty),
+        "selection_cv_std_penalty": float(DEFAULT_CONFIG.selection_cv_std_penalty),
+        "selection_distribution_shift_penalty": float(DEFAULT_CONFIG.selection_distribution_shift_penalty),
+        "selection_unseen_ratio_penalty": float(DEFAULT_CONFIG.selection_unseen_ratio_penalty),
+        "selection_max_llm_features": int(DEFAULT_CONFIG.selection_max_llm_features),
         "selection_min_features": int(DEFAULT_CONFIG.selection_min_features),
         "selection_forced_max_drop": float(DEFAULT_CONFIG.selection_forced_max_drop),
         "group_cv_used": bool(groups is not None),

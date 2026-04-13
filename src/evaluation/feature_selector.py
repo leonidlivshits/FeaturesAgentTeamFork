@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 CATBOOST_SELECTION_PARAMS = {
-    "iterations": 80,
-    "learning_rate": 0.07,
-    "depth": 4,
+    "iterations": 180,
+    "learning_rate": 0.05,
+    "depth": 6,
     "l2_leaf_reg": 3,
     "random_seed": DEFAULT_CONFIG.random_seed,
     "verbose": 0,
@@ -76,6 +76,8 @@ class CatBoostFeatureSelector:
             validated,
             key=lambda item: (
                 -float(item[1].proxy_score),
+                float(item[1].metadata.get("distribution_shift", 0.0)),
+                float(item[1].metadata.get("unseen_ratio", 0.0)),
                 float(item[1].missing_ratio),
                 float(item[1].compute_cost),
                 item[0],
@@ -130,11 +132,35 @@ class CatBoostFeatureSelector:
 
             round_best: tuple[FeatureCandidate, float, float, dict[str, Any]] | None = None
             search_width = self._search_width(round_idx=round_idx, total_remaining=len(remaining))
+            llm_selected_count = sum(1 for item in selected if item.source_family == "llm_planner")
+            max_llm_features = max(0, int(DEFAULT_CONFIG.selection_max_llm_features))
             round_candidates = sorted(
                 remaining,
-                key=lambda item: (-float(item.proxy_score), float(item.compute_cost), item.name),
+                key=lambda item: (
+                    -float(item.proxy_score),
+                    float(item.metadata.get("distribution_shift", 0.0)),
+                    float(item.metadata.get("unseen_ratio", 0.0)),
+                    float(item.compute_cost),
+                    item.name,
+                ),
             )[:search_width]
             for candidate in round_candidates:
+                if (
+                    candidate.source_family == "llm_planner"
+                    and llm_selected_count >= max_llm_features
+                ):
+                    trace.append(
+                        {
+                            "round": round_idx,
+                            "candidate": candidate.name,
+                            "candidate_family": candidate.source_family,
+                            "skipped": "llm_feature_cap",
+                            "max_llm_features": max_llm_features,
+                            "llm_selected_count": llm_selected_count,
+                            "search_width": search_width,
+                        }
+                    )
+                    continue
                 if runtime_budget is not None and selected and not runtime_budget.has_time(min_seconds_per_eval):
                     break
                 started_at = time.perf_counter()
@@ -149,7 +175,13 @@ class CatBoostFeatureSelector:
                 family_repeat_count = sum(1 for item in selected if item.source_family == candidate.source_family)
                 penalized_repeat_count = max(0, family_repeat_count - 1)
                 family_penalty = float(DEFAULT_CONFIG.selection_family_repeat_penalty) * penalized_repeat_count
-                effective_auc = float(mean_auc - family_penalty)
+                candidate_set = selected + [candidate]
+                mean_shift = float(np.mean([self._distribution_shift(item) for item in candidate_set]))
+                mean_unseen_ratio = float(np.mean([self._unseen_ratio(item) for item in candidate_set]))
+                cv_std_penalty = float(DEFAULT_CONFIG.selection_cv_std_penalty) * float(std_auc)
+                shift_penalty = float(DEFAULT_CONFIG.selection_distribution_shift_penalty) * mean_shift
+                unseen_penalty = float(DEFAULT_CONFIG.selection_unseen_ratio_penalty) * mean_unseen_ratio
+                effective_auc = float(mean_auc - family_penalty - cv_std_penalty - shift_penalty - unseen_penalty)
                 eval_trace = {
                     "round": round_idx,
                     "candidate": candidate.name,
@@ -157,6 +189,11 @@ class CatBoostFeatureSelector:
                     "mean_auc": round(mean_auc, 6),
                     "effective_auc": round(effective_auc, 6),
                     "std_auc": round(std_auc, 6),
+                    "cv_std_penalty": round(cv_std_penalty, 6),
+                    "mean_distribution_shift": round(mean_shift, 6),
+                    "mean_unseen_ratio": round(mean_unseen_ratio, 6),
+                    "shift_penalty": round(shift_penalty, 6),
+                    "unseen_penalty": round(unseen_penalty, 6),
                     "family_repeat_count": family_repeat_count,
                     "penalized_repeat_count": penalized_repeat_count,
                     "family_penalty": round(family_penalty, 6),
@@ -235,6 +272,8 @@ class CatBoostFeatureSelector:
         if train.nunique(dropna=True) < 2:
             raise ValueError("Feature is constant on train.")
 
+        metadata = candidate.metadata.copy()
+        metadata.update(self._stability_metrics(train=train, test=test))
         missing_ratio = candidate.missing_ratio or float(
             np.mean([train.isna().mean() if hasattr(train, "isna") else 0.0, test.isna().mean() if hasattr(test, "isna") else 0.0])
         )
@@ -247,7 +286,7 @@ class CatBoostFeatureSelector:
             proxy_score=float(proxy_score),
             missing_ratio=float(missing_ratio),
             compute_cost=float(candidate.compute_cost),
-            metadata=candidate.metadata.copy(),
+            metadata=metadata,
         )
 
     def _is_highly_redundant(self, left: FeatureCandidate, right: FeatureCandidate) -> bool:
@@ -436,6 +475,53 @@ class CatBoostFeatureSelector:
             -float(candidate.compute_cost),
             candidate.name,
         )
+
+    @staticmethod
+    def _distribution_shift(candidate: FeatureCandidate) -> float:
+        return float(candidate.metadata.get("distribution_shift", 0.0))
+
+    @staticmethod
+    def _unseen_ratio(candidate: FeatureCandidate) -> float:
+        return float(candidate.metadata.get("unseen_ratio", 0.0))
+
+    @staticmethod
+    def _stability_metrics(train: pd.Series, test: pd.Series) -> dict[str, float]:
+        if pd.api.types.is_numeric_dtype(train) and pd.api.types.is_numeric_dtype(test):
+            train_num = pd.to_numeric(train, errors="coerce").replace([np.inf, -np.inf], np.nan)
+            test_num = pd.to_numeric(test, errors="coerce").replace([np.inf, -np.inf], np.nan)
+            train_values = train_num.dropna().to_numpy(dtype="float64")
+            test_values = test_num.dropna().to_numpy(dtype="float64")
+            if len(train_values) < 8 or len(test_values) < 8:
+                return {"distribution_shift": 0.0, "unseen_ratio": 0.0}
+
+            quantiles = np.array([0.1, 0.5, 0.9], dtype="float64")
+            train_q = np.nanquantile(train_values, quantiles)
+            test_q = np.nanquantile(test_values, quantiles)
+            scale = max(
+                float(abs(train_q[2] - train_q[0])),
+                float(np.nanstd(train_values)),
+                1e-6,
+            )
+            quantile_shift = float(np.mean(np.abs(train_q - test_q)) / scale)
+            mean_shift = float(
+                abs(float(np.nanmean(train_values)) - float(np.nanmean(test_values)))
+                / max(float(np.nanstd(train_values)), 1e-6)
+            )
+            distribution_shift = float(min(3.0, 0.65 * quantile_shift + 0.35 * mean_shift))
+            return {"distribution_shift": distribution_shift, "unseen_ratio": 0.0}
+
+        train_cat = train.fillna("__nan__").astype(str)
+        test_cat = test.fillna("__nan__").astype(str)
+        train_freq = train_cat.value_counts(normalize=True, dropna=False)
+        test_freq = test_cat.value_counts(normalize=True, dropna=False)
+        unseen_ratio = float((~test_cat.isin(train_freq.index)).mean()) if len(test_cat) else 0.0
+
+        merged_index = train_freq.index.union(test_freq.index)
+        train_aligned = train_freq.reindex(merged_index, fill_value=0.0)
+        test_aligned = test_freq.reindex(merged_index, fill_value=0.0)
+        total_variation = float(0.5 * np.abs(train_aligned - test_aligned).sum())
+        distribution_shift = float(min(2.0, total_variation + unseen_ratio))
+        return {"distribution_shift": distribution_shift, "unseen_ratio": unseen_ratio}
 
 
 def score_single_feature_proxy(feature: pd.Series, target: pd.Series) -> float:

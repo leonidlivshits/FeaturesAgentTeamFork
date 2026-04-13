@@ -13,6 +13,16 @@ from src.data.schema import SchemaContext, build_schema_context
 logger = logging.getLogger(__name__)
 
 
+EXCLUDED_AUX_FILENAMES = {
+    "train.csv",
+    "test.csv",
+    "train_labels.csv",
+    "test_labels.csv",
+    "labels.csv",
+    "sample_submission.csv",
+}
+
+
 PREFERRED_ID_NAMES = (
     "id",
     "client_id",
@@ -46,7 +56,7 @@ def read_csv_auto(path: Path) -> pd.DataFrame:
             frame = _read_csv_with_sep(path=path, sep=sep, encoding=encoding)
             if frame is None:
                 continue
-            cleaned = _sanitize_column_names(frame)
+            cleaned = _drop_artifact_columns(_sanitize_column_names(frame))
             candidates.append(cleaned)
             # Fast path: plausible parse, avoid extra heavy full-file reads.
             if cleaned.shape[1] > 1:
@@ -66,20 +76,33 @@ def load_data_bundle(data_dir: Path) -> DataBundle:
     test = read_csv_auto(data_dir / "test.csv")
     train, test = _align_train_test_columns(train=train, test=test)
 
-    aux_tables: dict[str, pd.DataFrame] = {}
-    for csv_path in sorted(data_dir.glob("*.csv")):
-        if csv_path.name in {"train.csv", "test.csv"}:
-            continue
-        aux_tables[csv_path.stem] = read_csv_auto(csv_path)
-
-    readme_path = data_dir / "readme.txt"
-    data_readme = readme_path.read_text(encoding="utf-8", errors="ignore") if readme_path.exists() else ""
-
     try:
         id_column, target_column = infer_key_columns(train=train, test=test)
     except Exception as error:
         logger.warning("Key inference failed (%s). Applying fallback key inference.", error)
         train, test, id_column, target_column = infer_key_columns_fallback(train=train, test=test)
+
+    aux_tables: dict[str, pd.DataFrame] = {}
+    for csv_path in sorted(data_dir.glob("*.csv")):
+        if _should_skip_aux_file(csv_path.name):
+            logger.info("Skipping auxiliary file '%s' due reserved naming rule.", csv_path.name)
+            continue
+        frame = read_csv_auto(csv_path)
+        if _looks_like_target_table(
+            frame=frame,
+            table_name=csv_path.stem,
+            id_column=id_column,
+            target_column=target_column,
+        ):
+            logger.warning(
+                "Skipping auxiliary table '%s' because it looks like a label/target table.",
+                csv_path.name,
+            )
+            continue
+        aux_tables[csv_path.stem] = frame
+
+    readme_path = data_dir / "readme.txt"
+    data_readme = readme_path.read_text(encoding="utf-8", errors="ignore") if readme_path.exists() else ""
     schema_context = build_schema_context(
         train=train,
         test=test,
@@ -291,6 +314,22 @@ def _parse_quality_score(frame: pd.DataFrame) -> tuple[int, int, int]:
     return (n_columns, -unnamed, n_rows)
 
 
+def _drop_artifact_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    candidates = list(frame.columns)
+    drop_columns = [
+        column
+        for column in candidates
+        if str(column).strip().lower().startswith("unnamed")
+        or not str(column).strip()
+    ]
+    if not drop_columns:
+        return frame
+    kept = [column for column in candidates if column not in drop_columns]
+    if not kept:
+        return frame
+    return frame[kept].copy()
+
+
 def _detect_delimiters(path: Path) -> tuple[str, ...]:
     default = (",", ";", "\t", "|")
     try:
@@ -323,3 +362,65 @@ def _read_csv_with_sep(path: Path, sep: str, encoding: str) -> pd.DataFrame | No
         return pd.read_csv(path, sep=sep, engine="python", encoding=encoding)
     except Exception:
         return None
+
+
+def _should_skip_aux_file(file_name: str) -> bool:
+    lowered = str(file_name).strip().lower()
+    if lowered in EXCLUDED_AUX_FILENAMES:
+        return True
+    if lowered.endswith("_labels.csv"):
+        return True
+    return False
+
+
+def _looks_like_target_table(
+    *,
+    frame: pd.DataFrame,
+    table_name: str,
+    id_column: str,
+    target_column: str,
+) -> bool:
+    if frame.empty:
+        return False
+    lowered_name = table_name.lower()
+    if any(token in lowered_name for token in ("label", "target", "submission", "predict")):
+        return True
+
+    columns = [str(column) for column in frame.columns]
+    lowered_columns = {column.lower() for column in columns}
+    lowered_id = id_column.lower()
+    has_id_column = lowered_id in lowered_columns
+    if not has_id_column:
+        has_id_column = any(
+            token in lowered_columns
+            for token in ("id", "row_id", "client_id", "request_id", "application_id")
+        )
+    if not has_id_column:
+        return False
+
+    target_like_tokens = {"target", target_column.lower(), "label", "y", "y_true", "prediction", "score"}
+    target_like_columns = [column for column in columns if column.lower() in target_like_tokens]
+    if not target_like_columns:
+        return False
+
+    non_id_target_columns = [
+        column
+        for column in columns
+        if column.lower() not in {lowered_id, *target_like_tokens}
+    ]
+    if len(non_id_target_columns) > 1:
+        return False
+
+    for column in target_like_columns:
+        series = frame[column]
+        unique_count = int(series.nunique(dropna=True))
+        if unique_count <= 4:
+            return True
+        if pd.api.types.is_numeric_dtype(series):
+            finite = pd.to_numeric(series, errors="coerce").dropna()
+            if not finite.empty:
+                lower = float(finite.quantile(0.001))
+                upper = float(finite.quantile(0.999))
+                if 0.0 <= lower and upper <= 1.0:
+                    return True
+    return False

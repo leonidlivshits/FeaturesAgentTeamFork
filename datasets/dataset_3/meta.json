@@ -1,0 +1,54 @@
+{
+  "source_dataset": "C:\\Users\\tarli\\source\\SBER Hackathon\\FeaturesAgentTemplate\\datasets\\dataset_2",
+  "target_dataset": "C:\\Users\\tarli\\source\\SBER Hackathon\\FeaturesAgentTemplate\\datasets\\dataset_3",
+  "rows_total_labeled": 41188,
+  "train_rows": 24787,
+  "test_rows": 16401,
+  "holdout_months": [
+    "apr",
+    "may"
+  ],
+  "month_stats": {
+    "may": {
+      "count": 13769,
+      "pos": 886
+    },
+    "jun": {
+      "count": 5318,
+      "pos": 559
+    },
+    "jul": {
+      "count": 7174,
+      "pos": 649
+    },
+    "aug": {
+      "count": 6178,
+      "pos": 655
+    },
+    "oct": {
+      "count": 718,
+      "pos": 315
+    },
+    "nov": {
+      "count": 4101,
+      "pos": 416
+    },
+    "dec": {
+      "count": 182,
+      "pos": 89
+    },
+    "mar": {
+      "count": 546,
+      "pos": 276
+    },
+    "apr": {
+      "count": 2632,
+      "pos": 539
+    },
+    "sep": {
+      "count": 570,
+      "pos": 256
+    }
+  },
+  "random_seed": 42
+}

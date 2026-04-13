@@ -1,0 +1,18 @@
+{
+  "source_dataset": "C:\\Users\\tarli\\source\\SBER Hackathon\\FeaturesAgentTemplate\\datasets\\dataset_1",
+  "target_dataset": "C:\\Users\\tarli\\source\\SBER Hackathon\\FeaturesAgentTemplate\\datasets\\dataset_4",
+  "random_seed": 42,
+  "rows_total_labeled": 716042,
+  "train_rows": 655967,
+  "test_rows": 60075,
+  "train_positive_rate": 0.184415,
+  "test_positive_rate": 0.100258,
+  "holdout_department_ids": [
+    "13",
+    "15"
+  ],
+  "holdout_department_names": [
+    "pantry",
+    "canned goods"
+  ]
+}

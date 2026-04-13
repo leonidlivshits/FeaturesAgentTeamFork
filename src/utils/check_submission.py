@@ -24,6 +24,8 @@ ENV_PATH = ROOT / ".env"
 
 MAX_RUNTIME_SEC = 600
 MAX_FEATURES = 5
+PREFERRED_ID_NAMES = ("id", "client_id", "application_id", "request_id", "record_id")
+PREFERRED_TARGET_NAMES = ("target", "label", "y", "default")
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -163,15 +165,19 @@ def assert_output_structure(
     output_train: pd.DataFrame,
     output_test: pd.DataFrame,
 ) -> None:
+    id_column, target_column = infer_key_columns_local(input_train=input_train, input_test=input_test)
+
     # 1. Required columns
-    for col in input_train.columns:
-        assert col in output_train.columns, f"Missing required column in output/train.csv: {col}"
-    for col in input_test.columns:
-        assert col in output_test.columns, f"Missing required column in output/test.csv: {col}"
+    assert id_column in output_train.columns, f"Missing id column in output/train.csv: {id_column}"
+    assert target_column in output_train.columns, f"Missing target column in output/train.csv: {target_column}"
+    assert id_column in output_test.columns, f"Missing id column in output/test.csv: {id_column}"
+    assert target_column not in output_test.columns, (
+        f"output/test.csv must not contain target column: {target_column}"
+    )
 
     # 2. Features consistency and limit
-    reserved_train = set(input_train.columns)
-    reserved_test = set(input_test.columns)
+    reserved_train = {id_column, target_column}
+    reserved_test = {id_column}
 
     feature_cols_train = [c for c in output_train.columns if c not in reserved_train]
     feature_cols_test = [c for c in output_test.columns if c not in reserved_test]
@@ -236,8 +242,39 @@ def main() -> None:
 
     print("OK: submit passed basic checks")
     print(f"Runtime: {elapsed:.2f} sec")
-    print(f"Generated features: {len(output_test.columns) - len(input_test.columns)}")
+    id_column, _ = infer_key_columns_local(input_train=input_train, input_test=input_test)
+    print(f"Generated features: {len([c for c in output_test.columns if c != id_column])}")
     print(f"Output files: {train_out_path}, {test_out_path}")
+
+
+def infer_key_columns_local(input_train: pd.DataFrame, input_test: pd.DataFrame) -> tuple[str, str]:
+    common_columns = [column for column in input_train.columns if column in input_test.columns]
+    if not common_columns:
+        raise AssertionError("Unable to infer id column: no shared columns between train and test.")
+
+    target_candidates = [column for column in input_train.columns if column not in input_test.columns]
+    if target_candidates:
+        lowered = {str(column).lower(): str(column) for column in target_candidates}
+        target_column = next((lowered[name] for name in PREFERRED_TARGET_NAMES if name in lowered), target_candidates[0])
+    else:
+        lowered = {str(column).lower(): str(column) for column in common_columns}
+        target_column = next((lowered[name] for name in PREFERRED_TARGET_NAMES if name in lowered), "")
+        if not target_column:
+            binary = [
+                str(column)
+                for column in common_columns
+                if input_train[column].nunique(dropna=True) <= 2 and "id" not in str(column).lower()
+            ]
+            if not binary:
+                raise AssertionError("Unable to infer target column from train/test.")
+            target_column = binary[0]
+
+    id_candidates = [column for column in common_columns if str(column) != str(target_column)]
+    if not id_candidates:
+        raise AssertionError("Unable to infer id column after excluding target.")
+    lowered_ids = {str(column).lower(): str(column) for column in id_candidates}
+    id_column = next((lowered_ids[name] for name in PREFERRED_ID_NAMES if name in lowered_ids), id_candidates[0])
+    return str(id_column), str(target_column)
 
 
 if __name__ == "__main__":

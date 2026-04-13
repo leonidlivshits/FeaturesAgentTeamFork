@@ -71,3 +71,86 @@ def test_forward_selection_uses_group_kfold_and_returns_max_five_features() -> N
     assert result.cv_strategy == "stratified_group_kfold"
     assert 1 <= len(result.selected_candidates) <= 5
     assert list(result.feature_set.train_features.columns) == list(result.feature_set.test_features.columns)
+
+
+def test_pruning_adds_stability_metadata_for_numeric_and_categorical() -> None:
+    target = pd.Series([0, 1] * 10)
+    selector = CatBoostFeatureSelector(cv_folds=3, random_seed=42)
+    candidates = [
+        FeatureCandidate(
+            name="numeric_shifted",
+            train_feature=pd.Series(np.linspace(0.0, 1.0, num=20)),
+            test_feature=pd.Series(np.linspace(2.0, 3.0, num=10)),
+            source_family="synthetic",
+            compute_cost=0.1,
+        ),
+        FeatureCandidate(
+            name="categorical_unseen",
+            train_feature=pd.Series(["a", "b"] * 10),
+            test_feature=pd.Series(["a", "z", "a", "z", "a", "z", "a", "z", "a", "z"]),
+            source_family="synthetic",
+            compute_cost=0.1,
+        ),
+    ]
+
+    pruned = selector.prune_candidates(candidates, target=target, max_candidates=10)
+    metrics = {candidate.name: candidate.metadata for candidate in pruned}
+
+    assert metrics["gen_numeric_shifted"]["distribution_shift"] > 0.0
+    assert metrics["gen_numeric_shifted"]["unseen_ratio"] == 0.0
+    assert metrics["gen_categorical_unseen"]["distribution_shift"] > 0.0
+    assert metrics["gen_categorical_unseen"]["unseen_ratio"] > 0.0
+
+
+def test_forward_selection_caps_llm_features() -> None:
+    rng = np.random.default_rng(42)
+    size = 80
+    target = pd.Series(([0, 1] * (size // 2)))
+    signal = target.astype(float)
+    candidates = [
+        FeatureCandidate(
+            name="llm_feature_1",
+            train_feature=pd.Series(signal + rng.normal(0, 0.05, size=size)),
+            test_feature=pd.Series(signal[:20] + rng.normal(0, 0.05, size=20)),
+            source_family="llm_planner",
+            compute_cost=0.15,
+        ),
+        FeatureCandidate(
+            name="llm_feature_2",
+            train_feature=pd.Series(signal + rng.normal(0, 0.07, size=size)),
+            test_feature=pd.Series(signal[:20] + rng.normal(0, 0.07, size=20)),
+            source_family="llm_planner",
+            compute_cost=0.15,
+        ),
+        FeatureCandidate(
+            name="llm_feature_3",
+            train_feature=pd.Series(signal + rng.normal(0, 0.09, size=size)),
+            test_feature=pd.Series(signal[:20] + rng.normal(0, 0.09, size=20)),
+            source_family="llm_planner",
+            compute_cost=0.15,
+        ),
+        FeatureCandidate(
+            name="heuristic_feature_1",
+            train_feature=pd.Series(signal + rng.normal(0, 0.14, size=size)),
+            test_feature=pd.Series(signal[:20] + rng.normal(0, 0.14, size=20)),
+            source_family="heuristic",
+            compute_cost=0.1,
+        ),
+        FeatureCandidate(
+            name="heuristic_feature_2",
+            train_feature=pd.Series(signal + rng.normal(0, 0.16, size=size)),
+            test_feature=pd.Series(signal[:20] + rng.normal(0, 0.16, size=20)),
+            source_family="heuristic",
+            compute_cost=0.1,
+        ),
+    ]
+
+    selector = CatBoostFeatureSelector(cv_folds=3, random_seed=42)
+    result = selector.select_best(
+        candidates=candidates,
+        target=target,
+        max_features=4,
+        max_candidates=5,
+    )
+    llm_count = sum(1 for item in result.selected_candidates if item.source_family == "llm_planner")
+    assert llm_count <= 2
