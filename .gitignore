@@ -17,3 +17,5 @@ output/*
 .features_agent_cache/
 catboost_info/
 .env
+dist/
+datasets/_backups/
